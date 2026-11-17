@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shop · GitOps Demo</title>
+</head>
+<body>
+  <header>
+    <h1>Shop</h1>
+    <p class="meta">GitOps 演示 · 前端静态站 + Go API + PostgreSQL</p>
+  </header>
+
+  <main>
+    <section id="products" class="grid">
+      <p class="loading">加载中…</p>
+    </section>
+
+    <aside id="toast" class="toast" hidden></aside>
+  </main>
+
+  <footer>
+    <span id="pod">backend pod: —</span>
+    <span id="build">build: __BUILD__</span>
+  </footer>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

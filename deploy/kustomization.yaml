@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: shop
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - backend.yaml
+  - frontend.yaml
+  - ingress.yaml
+
+# CI 会改写这里，把 tag 换成当前 commit sha
+images:
+  - name: ghcr.io/jeffrey-xu/shop-gitops/backend
+    newTag: bootstrap
+  - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
+    newTag: bootstrap
+
+labels:
+  - pairs:
+      app.kubernetes.io/managed-by: argocd
+    includeSelectors: false
