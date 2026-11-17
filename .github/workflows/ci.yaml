@@ -28,6 +28,10 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 镜像前缀转小写
+        id: meta
+        run: echo "prefix=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: 设置 Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -46,8 +50,8 @@ jobs:
           build-args: |
             BUILD_ID=${{ github.sha }}
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}:${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.prefix }}/${{ matrix.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.prefix }}/${{ matrix.name }}:latest
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
@@ -61,12 +65,12 @@ jobs:
       - name: 把镜像 tag 改成当前 commit sha
         env:
           SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
-          REG: ${{ env.REGISTRY }}
         run: |
           set -euo pipefail
+          # Docker tag 必须小写，GitHub 用户名 Jeffrey-Xu 是混合大小写
+          PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
           for svc in backend frontend; do
-            yq -i "(.images[] | select(.name == \"${REG}/${REPO}/${svc}\") | .newTag) = \"${SHA}\"" deploy/kustomization.yaml
+            yq -i "(.images[] | select(.name == \"${PREFIX}/${svc}\") | .newTag) = \"${SHA}\"" deploy/kustomization.yaml
           done
           echo "--- 结果 ---"
           yq '.images' deploy/kustomization.yaml
