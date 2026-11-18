@@ -13,9 +13,9 @@ resources:
 # api 和 worker 用的是同一个 backend 镜像，所以只需要两条
 images:
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: f8ab12f6cdc1b56b015cb3fa2160e85546f5c741
+    newTag: 0364df2aba609ac99e275deeff6db16fd690ba79
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: f8ab12f6cdc1b56b015cb3fa2160e85546f5c741
+    newTag: 0364df2aba609ac99e275deeff6db16fd690ba79
 labels:
   - pairs:
       app.kubernetes.io/managed-by: argocd
