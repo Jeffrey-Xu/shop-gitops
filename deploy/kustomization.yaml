@@ -10,9 +10,9 @@ resources:
 # CI 会改写这里，把 tag 换成当前 commit sha
 images:
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: e54ec6e0db7c0ebe3be7ef9f8f3594463a7e7861
+    newTag: 215d39d9601854c24d56e7abc2681d4b71c87ce2
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: e54ec6e0db7c0ebe3be7ef9f8f3594463a7e7861
+    newTag: 215d39d9601854c24d56e7abc2681d4b71c87ce2
 labels:
   - pairs:
       app.kubernetes.io/managed-by: argocd
