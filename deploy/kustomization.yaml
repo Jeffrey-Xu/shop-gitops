@@ -3,10 +3,12 @@ kind: Kustomization
 namespace: shop
 resources:
   - namespace.yaml
-  - backend.yaml
+  - api.yaml
+  - worker.yaml
   - frontend.yaml
   - ingress.yaml
 # CI 会改写这里，把 tag 换成当前 commit sha
+# api 和 worker 用的是同一个 backend 镜像，所以只需要两条
 images:
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
     newTag: 37ef51d5b9931af3fc542fe150c5f87428b2d9ff

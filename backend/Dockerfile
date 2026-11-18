@@ -7,11 +7,15 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server .
+# 一个镜像两个二进制：api 和 worker 共享 internal 包，
+# 部署时靠 command 区分角色，CI 只构建一次，版本天然一致。
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/worker ./cmd/worker
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app
-COPY --from=build /out/server /server
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 app
+COPY --from=build /out/api /app/api
+COPY --from=build /out/worker /app/worker
 USER app
 EXPOSE 8080
-ENTRYPOINT ["/server"]
+CMD ["/app/api"]

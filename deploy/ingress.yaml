@@ -20,7 +20,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: backend
+                name: api
                 port:
                   number: 8080
           - path: /
@@ -37,7 +37,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: backend
+                name: api
                 port:
                   number: 8080
           - path: /
