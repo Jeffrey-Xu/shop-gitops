@@ -1,63 +1,151 @@
 # shop-gitops
 
-前后端分离的最小电商骨架，用 **GitHub Actions 构建 + ArgoCD 交付**，在本地 Docker Desktop Kubernetes 上跑通完整的 GitOps 闭环。
+一个刻意做小的电商后端，用来把 **缓存 + 消息队列 + 事务性 outbox + 可观测性** 这几件事在真集群里跑通。
+
+前端是静态站，后端是 Go（`api` + `worker` 两个入口同一个镜像），数据落宿主机的 PostgreSQL，Redis 做读缓存，RabbitMQ 做异步事件。交付走 **GitHub Actions 构建 + ArgoCD 同步**。
 
 ```
 改代码 push
    │
-   ├─ GitHub Actions  ── build backend/frontend → push ghcr.io → 改 deploy/ 里的 tag 并提交
+   ├─ GitHub Actions  ── build backend/frontend（amd64+arm64）→ push ghcr.io
+   │                     └─ 回写 deploy/kustomization.yaml 的 image tag 并提交
    │
-   └─ ArgoCD          ── 发现新 commit → 对比 live state → 自动 sync 到集群
+   └─ ArgoCD          ── 发现新 commit → 对比 live state → 自动 sync
 ```
 
-## 组成
+## 目录
 
 | 路径 | 内容 |
 |---|---|
-| `frontend/` | Vite + 原生 JS，构建成静态 `dist/`，由 nginx 提供 |
-| `backend/` | Go 单二进制，`/api/products`、`/api/cart`，连 PostgreSQL |
-| `deploy/` | Kustomize 清单：namespace、前后端 Deployment（各 1 副本）、Ingress |
-| `argocd/` | ArgoCD `Application` 定义 |
-| `.github/workflows/ci.yaml` | 构建推送 + 回写镜像 tag |
-
-> 数据库不跑在集群里。后端连宿主机上的 Homebrew PostgreSQL 18（`host.docker.internal:5432/shop`，库 `shop`，角色 `shop/shop`），由 Docker Desktop 的 DNS 解析到 `192.168.65.254`。本地学习用，单副本、无高可用、无备份。
+| `backend/cmd/api/` | HTTP 服务入口，另起一个 outbox relay 协程 |
+| `backend/cmd/worker/` | RabbitMQ 消费者入口，同时提供 `/healthz` 与 `/metrics` |
+| `backend/internal/` | `config` `obs` `httpx` `cache` `store` `broker` `outbox` `api` `worker` |
+| `backend/internal/store/migrations/` | `go:embed` 的 SQL 迁移，启动时同步执行，失败即退出 |
+| `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管 |
+| `deploy/` | Kustomize：namespace、api/worker/frontend、ingress、monitoring |
+| `argocd/` | ArgoCD 引导清单（`install.yaml` 不进 Git） |
+| `monitoring/` | metrics-server / kube-prometheus-stack / loki / alloy 的 Application |
+| `scripts/` | `git-doctor.sh` 推送链路诊断、`push-via-api.py` 兜底提交 |
+| `.github/workflows/ci.yaml` | 矩阵构建 + 回写 tag |
 
 ## 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/hello` | 返回 Pod 名与版本，验证分流 |
-| GET | `/api/products` | 商品列表（读 PG） |
-| POST | `/api/cart` | 下单扣库存（事务内条件更新） |
-| GET | `/healthz` | 存活探针，不查 DB |
-| GET | `/readyz` | 就绪探针，查 DB，失败则摘流量 |
+| GET | `/api/products` | 商品列表，走 Redis，响应头带 `X-Cache: HIT\|MISS` |
+| GET | `/api/products/{id}` | 单商品 |
+| POST | `/api/orders` | 下单，扣库存 + 建单 + 写 outbox，一个事务 |
+| GET | `/api/orders/{id}` | 订单详情含状态迁移历史 |
+| GET | `/api/stats` | 缓存命中率、队列深度、各状态订单数，前端 footer 用 |
+| POST | `/api/dev/fault?type=panic\|slow\|error` | 故障注入，仅 `DEV_MODE=true` 时存在 |
+| GET | `/metrics` | Prometheus 指标（api 与 worker 各一份） |
+| GET | `/healthz` | liveness，不查任何依赖 |
+| GET | `/readyz` | readiness，查 PG **和** Redis，任一失败即 503 |
 
-> `healthz` 与 `readyz` 故意分开：DB 挂了应该停止接流量，而不是被 liveness 反复重启。
+> `healthz` 与 `readyz` 分开：依赖挂了应该摘流量，不该被 liveness 反复重启。
+> 注意 `readyz` 目前把 Redis 当成硬依赖，Redis 挂会导致整个 api 摘流量——见「已知限制」。
 
-## 本地访问
+## 一次下单的完整路径
 
-```bash
-kubectl port-forward -n argocd svc/argocd-server 8080:80
-open http://localhost:8080          # admin / 见 argocd-initial-admin-secret
+```
+POST /api/orders  (Idempotency-Key 可选)
+   │
+   ├─ httpx.Wrap            生成/透传 X-Request-ID，记指标与访问日志
+   │
+   ├─ 单事务 ─────────────────────────────────────────────┐
+   │    UPDATE products SET stock = stock - $1            │
+   │     WHERE id = $2 AND stock >= $1 RETURNING price    │ ← 条件更新即乐观锁
+   │    INSERT orders  (status='CREATED', idempotency_key)│ ← 撞唯一键则回滚并返回旧单
+   │    INSERT order_items (快照单价)                      │
+   │    INSERT order_events ('' → 'CREATED')              │
+   │    INSERT outbox (topic='order.created')             │ ← 和订单同一事务
+   │  COMMIT                                              │
+   │                                                      │
+   └─ 提交后：DEL 商品缓存（失败只 warn，不回滚）──────────┘
+   │
+   ▼
+outbox relay（api 进程内，每 2s 扫表）
+   │  Publish + publisher confirm  →  published_at = now()
+   ▼
+shop.events (topic) ──order.created──▶ shop.order.created
+   │
+   ▼
+worker：basic.consume（push，非轮询，prefetch=5）
+   ├─ 闸门 1：status != CREATED → ack 跳过（重复投递短路）
+   ├─ 闸门 2：UPDATE ... WHERE status='CREATED'（乐观锁）
+   │           + order_events 唯一约束兜底
+   └─ ack → 订单变 PAID
 ```
 
-集群里走 Ingress：
+失败路径（worker 内）：
 
-```bash
-curl http://shop.localhost/            # 前端
-curl http://shop.localhost/api/products
+```
+支付失败
+ ├─ attempts < 3 ──▶ publish 到 shop.dlx / .retry（TTL 10s 自动回主队列）──▶ ack
+ └─ attempts >= 3 ─▶ publish 到 .dlq ──▶ CancelOrder（状态 CANCELLED + 库存回补 + 审计）──▶ ack
 ```
 
-## 关键设计
+设计取舍：**at-least-once + 消费端幂等**，而不是「commit 完再 publish」。后者会丢消息且无法发现。代价是可能重复投递，由两道闸门消化。
 
-- **同域反代**：前端只写相对路径 `/api/...`，CORS 问题不存在
-- **镜像用 commit sha**：不用 `latest`，回滚有确定性，ArgoCD 能判断 Git 是否真的变了
-- **DB 在集群内**：StatefulSet + 2Gi PVC，`replication_factor` 无所谓，目的是让 demo 自包含
-- **selfHeal**：手工 `kubectl edit` 会被 ArgoCD 自动拉回 Git 的状态
+## 数据模型
 
-## 需要手工做一次的
+| 表 | 关键字段 | 说明 |
+|---|---|---|
+| `products` | `price_cents INT`、`stock`、`version` | 金额用整数分，不用浮点 |
+| `orders` | `status`、`total_cents`、`idempotency_key UNIQUE` | 状态机 `CREATED → PAID / CANCELLED` |
+| `order_items` | `unit_price_cents` | 下单时快照单价，改价不影响历史单 |
+| `order_events` | `from_status`、`to_status`、`UNIQUE(order_id,to_status)` | 状态迁移审计，日志之外的第二证据 |
+| `outbox` | `topic`、`payload jsonb`、`published_at`、`attempts` | 未投递事件队列 |
 
-GitHub Packages 默认私有，要让集群匿名拉镜像，需把两个 package 设为 public：
+**库存只在 PostgreSQL 扣，Redis 不参与扣减。** 缓存只负责读得快，一致性交给数据库。
+
+## 部署形态
+
+集群里一个 `shop` 命名空间，Kustomize 渲染出 13 个对象：
+
+```
+Namespace shop
+ConfigMap shop-config        APP_VERSION / LOG_LEVEL / CACHE_TTL / DEV_MODE
+                             REDIS_ADDR / MQ_PREFETCH / MQ_MAX_ATTEMPTS
+Secret    shop-secret        database-url / rabbitmq-url
+Deployment api     1 副本    /app/api      req 50m/64Mi   limit 500m/256Mi
+Deployment worker  1 副本    /app/worker   req 30m/48Mi   limit 300m/192Mi
+Deployment frontend 1 副本   nginx:1.27    req 20m/32Mi   limit 200m/128Mi
+Service   api / frontend / worker
+Ingress   shop               shop.localhost + 无 host 兜底
+ServiceMonitor api / worker
+PrometheusRule shop         3 条告警
+```
+
+- 三个 Deployment 都是 `replicas: 1` + `strategy: Recreate`。本地学习环境，不做高可用
+- 容器以 uid `10001` 非 root 运行，`readOnlyRootFilesystem`，drop 所有 capability
+- 探针：readiness `/readyz`（5s/5s，失败 3 次摘流量）、liveness `/healthz`（20s/10s）
+- Ingress 带 `limit-rps: 50`：**压测会先撞到这个，看到 503 不是应用的问题**
+
+**中间件不在集群里。** PostgreSQL / Redis / RabbitMQ 全部由宿主 Homebrew 提供，Pod 通过 `host.docker.internal`（解析到 `192.168.65.254`）访问：
+
+| 依赖 | 地址 | 凭证 |
+|---|---|---|
+| PostgreSQL 18 | `host.docker.internal:5432/shop` | `shop/shop` |
+| Redis 8 | `host.docker.internal:6379` | 无 |
+| RabbitMQ | `host.docker.internal:5672`，vhost `/shop` | `shop/shoppass` |
+
+RabbitMQ 拓扑在 api/worker 启动时幂等声明：
+
+```
+shop.events (topic)   --order.created-->  shop.order.created
+shop.dlx    (direct)  --.retry--------->  shop.order.created.retry   TTL 10s → 回主队列
+                      --.dlq----------->  shop.order.created.dlq
+```
+
+## 从零重建时要手工做的一次性动作
+
+代码和清单都在 Git 里，但下面三件事不在：
+
+**① GitHub package 设为 public**（否则 Pod `ImagePullBackOff`）
+
+仓库是 public，Actions 用 `GITHUB_TOKEN` 推的镜像**继承仓库可见性**，所以不需要额外 `write:packages` 权限。但 package 本身要手工设一次：
 
 ```
 https://github.com/users/Jeffrey-Xu/packages/container/shop-gitops%2Fbackend/settings
@@ -65,6 +153,95 @@ https://github.com/users/Jeffrey-Xu/packages/container/shop-gitops%2Ffrontend/se
 ```
 
 或者建 `imagePullSecret` 走认证拉取。
+
+**② 宿主中间件**
+
+```bash
+# PostgreSQL：建角色和库
+psql -d postgres -c "CREATE ROLE shop LOGIN PASSWORD 'shop'"
+psql -d postgres -c "CREATE DATABASE shop OWNER shop"
+
+# RabbitMQ：建用户 + vhost + 权限，并启用指标插件
+rabbitmqctl add_user shop shoppass
+rabbitmqctl add_vhost /shop
+rabbitmqctl set_permissions -p /shop shop ".*" ".*" ".*"
+rabbitmq-plugins enable rabbitmq_prometheus
+```
+
+**③ ArgoCD 引导**
+
+`argocd/install.yaml` 故意**不进 Git**（它是 bootstrap 用的 v3.6.1 清单），装完后手工 apply 5 个 Application：
+
+```bash
+kubectl apply -f argocd/install.yaml -n argocd    # 首次
+kubectl apply -f argocd/application.yaml          # shop
+kubectl apply -f monitoring/                      # 4 个平台 Application
+```
+
+## 本地访问
+
+```bash
+curl http://localhost/                  # 前端（Ingress 有无 host 兜底规则）
+curl http://shop.localhost/             # 同一个入口
+curl -D- http://localhost/api/products  # 看 X-Cache
+curl http://localhost/api/stats
+```
+
+| 入口 | 说明 |
+|---|---|
+| `http://localhost/` 或 `http://shop.localhost/` | 业务站 |
+| `http://argocd.localhost` | ArgoCD，admin 密码见 `argocd-initial-admin-secret` |
+| `http://grafana.localhost` | Grafana `admin/admin` |
+
+ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`。
+
+## 可观测性
+
+集群内 `monitoring` 命名空间，4 个 Application 全由 ArgoCD 管：
+
+| 组件 | Chart | 说明 |
+|---|---|---|
+| metrics-server | 3.14.0 | `kubectl top`，带 `--kubelet-insecure-tls` |
+| kube-prometheus-stack | 93.4.0 | Prometheus + Grafana + Alertmanager + node-exporter |
+| loki | 7.6.0 | SingleBinary 模式 |
+| alloy | 1.16.0 | DaemonSet，走 API 读容器日志，`stage.cri` + `stage.json` |
+
+应用侧指标：`shop_http_requests_total`、`shop_cache_lookups_total`、`shop_orders_processed_total`、`shop_queue_depth`、`shop_outbox_pending`。
+
+告警（`PrometheusRule`）：5xx 比例过高（2m）、队列积压 > 10（3m）、outbox 卡住 > 20（3m）。
+
+> ServiceMonitor **必须**带 `release: kube-prometheus-stack` 标签，否则静默不抓。
+
+## 故障演练
+
+```bash
+# 制造 panic / 慢请求 / 500，用来在 Grafana 里看链路
+curl -X POST 'http://localhost/api/dev/fault?type=panic'
+curl -X POST 'http://localhost/api/dev/fault?type=slow'
+curl -X POST 'http://localhost/api/dev/fault?type=error'
+
+# 队列堆积：停掉 worker 后下单，队列涨、订单停在 CREATED
+kubectl -n shop scale deploy/worker --replicas=0
+# 恢复后积压自动消费完
+kubectl -n shop scale deploy/worker --replicas=1
+
+# 支付失败 → 3 次重试 → DLQ + 库存回补
+redis-cli SET shop:demo:fail 1
+
+# 幂等：同一 key 第一次 201，第二次 200，同一个订单号
+curl -X POST http://localhost/api/orders -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-1' -d '{"productId":1,"quantity":1}'
+```
+
+## 已知限制
+
+- `readyz` 把 Redis 当硬依赖：Redis 挂了整站 503，而实际上下单链路不需要它
+- `MaxOpenConns(10)` 与 `MaxIdleConns(5)` 硬编码在 `store.go`，且 idle 应等于 open
+- DSN 没设 `statement_timeout`，慢查询会一直占着连接
+- `CreateOrder` 提交后又回查三次拿详情，多两次往返
+- `orders(status)` 无索引，`/api/stats` 每次全表扫
+- 单副本、无 HPA/PDB、无 NetworkPolicy
+- 没有用户体系，`Idempotency-Key` 由前端生成
 
 ## 推送排障：`git push` 报 502 / 超时怎么办
 
