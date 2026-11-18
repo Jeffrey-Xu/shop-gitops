@@ -32,6 +32,9 @@ jobs:
         id: meta
         run: echo "prefix=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: 设置 Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -47,6 +50,8 @@ jobs:
         with:
           context: ${{ matrix.context }}
           push: true
+          # Apple Silicon 本地集群是 arm64，CI runner 是 amd64，必须多架构
+          platforms: linux/amd64,linux/arm64
           build-args: |
             BUILD_ID=${{ github.sha }}
           tags: |
