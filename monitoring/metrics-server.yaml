@@ -1,0 +1,36 @@
+# 第一个装：kubectl top 和 HPA 都依赖它
+# 装进 kube-system，和 chart 默认一致
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metrics-server
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://kubernetes-sigs.github.io/metrics-server/
+    chart: metrics-server
+    targetRevision: 3.14.0
+    helm:
+      valuesObject:
+        replicas: 1
+        # Docker Desktop 的 kubelet 用自签证书，不加 --kubelet-insecure-tls
+        # 会一直 0/1，日志里是 x509: certificate signed by unknown authority
+        args:
+          - --kubelet-insecure-tls
+          - --kubelet-preferred-address-types=InternalIP
+        resources:
+          requests:
+            cpu: 20m
+            memory: 40Mi
+          limits:
+            memory: 120Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
