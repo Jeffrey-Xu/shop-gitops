@@ -18,6 +18,12 @@ spec:
       valuesObject:
         controller:
           type: daemonset
+          # Docker Desktop 的 control-plane 带 NoSchedule 污点，
+          # 不容忍就只剩 1 个副本，控制面（etcd/apiserver）的日志会漏采
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
 
         alloy:
           resources:

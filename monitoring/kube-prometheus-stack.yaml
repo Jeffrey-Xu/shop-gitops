@@ -78,9 +78,9 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 150Mi
+              memory: 250Mi
             limits:
-              memory: 400Mi
+              memory: 700Mi
           # 用 Host 而不是 path 前缀，避开 root_url / serve_from_sub_path 那堆坑
           ingress:
             enabled: true
