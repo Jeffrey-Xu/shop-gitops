@@ -65,3 +65,45 @@ https://github.com/users/Jeffrey-Xu/packages/container/shop-gitops%2Ffrontend/se
 ```
 
 或者建 `imagePullSecret` 走认证拉取。
+
+## 推送排障：`git push` 报 502 / 超时怎么办
+
+这台机器所有出网流量都走本地代理（`HTTPS_PROXY=http://127.0.0.1:63087`）。代理是
+`CONNECT` 隧道，它自己连不上 github.com 时会把 502 原样吐给 git，看起来像"被墙"，
+实际上**不是策略封锁**，通常是一过性上游问题或 DNS 解析到了不通的 POP。
+
+先分层定位，别猜：
+
+```bash
+scripts/git-doctor.sh
+```
+
+它依次检查 DNS → 代理 CONNECT → api.github.com → gh 认证 → `git ls-remote`，
+哪一层红就是哪一层的问题：
+
+| 红的步骤 | 含义 | 处理 |
+|---|---|---|
+| 1 DNS | 解析不到，或解析到不通的 IP | `dscacheutil -flushcache`；反复不行就写 `/etc/hosts` 钉一个可用 IP |
+| 2 CONNECT | 代理到 github.com:443 建不起隧道 | 等几分钟重试；持续不行用下面的 API 兜底 |
+| 3 api | 兜底通道也不通 | 换网络（手机热点）验证是不是本地网络的问题 |
+| 4 gh 认证 | token 过期 / 未登录 | `gh auth login`，需要 `repo` 权限 |
+| 5 ls-remote | 能连但协议层协商失败 | 检查 `git remote -v` 地址、是否误设了 `http.proxy` |
+
+### 兜底：走 API 落提交
+
+`api.github.com` 和 `github.com` 是两套入口，前者通就可以绕开 git 协议：
+
+```bash
+python3 scripts/push-via-api.py
+git fetch && git reset --hard origin/main   # 对齐历史，API 造的 commit hash 与本地不同
+```
+
+原理是用 Git Data API 依次建 blob → tree → commit → 移动 ref，语义等价于
+`push --force-with-lease`。脚本会检查远端有没有本地不存在的文件，有就拒绝覆盖。
+
+### 别做的事
+
+- **不要 `git config --global http.proxy ""`**：这里必须走代理，清掉只会变成彻底连不上
+- **不要改 `~/.ssh` 去试 SSH**：22 端口本来就出不去，SSH over 443 在代理下同样要 CONNECT
+- **不要反复 `git push -f`**：CI 的 bump job 会回写 `deploy/kustomization.yaml`，
+  硬推会把它的更新打掉，ArgoCD 随后会看到一个倒退的 tag
