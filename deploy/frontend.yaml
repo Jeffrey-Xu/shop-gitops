@@ -6,7 +6,7 @@ metadata:
     app: frontend
     app.kubernetes.io/part-of: shop
 spec:
-  replicas: 2
+  replicas: 1
   revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
@@ -70,13 +70,3 @@ spec:
     - name: http
       port: 80
       targetPort: http
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: frontend
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: frontend
