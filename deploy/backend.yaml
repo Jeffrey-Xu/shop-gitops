@@ -6,7 +6,9 @@ metadata:
     app.kubernetes.io/part-of: shop
 type: Opaque
 stringData:
-  postgres-password: postgres
+  # 指向宿主机的 Homebrew PostgreSQL 18（不是集群内的库）
+  # host.docker.internal 由 Docker Desktop 注入，Pod 内可直接解析到 192.168.65.254
+  database-url: "postgres://shop:shop@host.docker.internal:5432/shop?sslmode=disable"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -15,7 +17,6 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shop
 data:
-  DATABASE_URL: "postgres://postgres:postgres@postgres:5432/shop?sslmode=disable"
   APP_VERSION: "v1"
 ---
 apiVersion: apps/v1
@@ -28,11 +29,9 @@ metadata:
 spec:
   replicas: 1
   revisionHistoryLimit: 3
+  # 单副本 + 本地学习：用 Recreate，避免滚动更新时临时起第二个 Pod
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   selector:
     matchLabels:
       app: backend
@@ -55,6 +54,13 @@ spec:
           envFrom:
             - configMapRef:
                 name: shop-config
+          env:
+            # 连接串含口令，放 Secret；同名 env 优先级高于 envFrom
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: database-url
           readinessProbe:
             httpGet:
               path: /readyz

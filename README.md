@@ -16,9 +16,11 @@
 |---|---|
 | `frontend/` | Vite + 原生 JS，构建成静态 `dist/`，由 nginx 提供 |
 | `backend/` | Go 单二进制，`/api/products`、`/api/cart`，连 PostgreSQL |
-| `deploy/` | Kustomize 清单：namespace、postgres StatefulSet、前后端 Deployment、Ingress |
+| `deploy/` | Kustomize 清单：namespace、前后端 Deployment（各 1 副本）、Ingress |
 | `argocd/` | ArgoCD `Application` 定义 |
 | `.github/workflows/ci.yaml` | 构建推送 + 回写镜像 tag |
+
+> 数据库不跑在集群里。后端连宿主机上的 Homebrew PostgreSQL 18（`host.docker.internal:5432/shop`，库 `shop`，角色 `shop/shop`），由 Docker Desktop 的 DNS 解析到 `192.168.65.254`。本地学习用，单副本、无高可用、无备份。
 
 ## 接口
 
