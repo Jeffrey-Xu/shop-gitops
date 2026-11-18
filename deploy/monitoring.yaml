@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shop
+  labels:
+    app.kubernetes.io/part-of: shop
+    # ruleSelector 同样只认这个标签
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: shop.api
+      rules:
+        - alert: ShopApiHighErrorRate
+          expr: |
+            sum(rate(shop_http_requests_total{status=~"5.."}[5m]))
+              /
+            sum(rate(shop_http_requests_total[5m])) > 0.05
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "api 5xx 比例超过 5%"
+            description: "近 5 分钟 5xx 占比 {{ $value | humanizePercentage }}，先看 Loki 里 level=error 的 request_id"
+
+        - alert: ShopQueueBacklog
+          expr: shop_queue_depth > 10
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "订单队列积压超过 10 条"
+            description: "worker 可能挂了或消费太慢；队列 {{ $labels.queue }} 当前 {{ $value }} 条"
+
+        - alert: ShopOutboxStuck
+          expr: shop_outbox_pending > 20
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "outbox 积压，事件发不出去"
+            description: "{{ $value }} 行未投递超过 3 分钟，基本可以断定 RabbitMQ 连接有问题"

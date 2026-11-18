@@ -67,6 +67,12 @@ spec:
                   source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
                   target_label  = "app"
                 }
+                # 我们自己的工作负载用的是简写 label app，不是 k8s 推荐的
+                # app.kubernetes.io/name，所以两条都要有，后者覆盖前者
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_label_app"]
+                  target_label  = "app"
+                }
                 rule {
                   source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
                   separator    = "/"
@@ -81,6 +87,30 @@ spec:
 
               loki.process "pipeline" {
                 stage.cri {}
+
+                # 后端输出的是 slog JSON，这里解析成结构化字段：
+                # level 提成 label（基数只有 5 个，可以当索引）
+                # request_id / order_id 放 structured metadata（不建索引但可按等值过滤）
+                stage.json {
+                  expressions = {
+                    level = "level",
+                    msg   = "msg",
+                  }
+                }
+
+                stage.labels {
+                  values = {
+                    level = "",
+                  }
+                }
+
+                stage.structured_metadata {
+                  values = {
+                    request_id = "request_id",
+                    order_id   = "order_id",
+                    service    = "service",
+                  }
+                }
 
                 forward_to = [loki.write.default.receiver]
               }

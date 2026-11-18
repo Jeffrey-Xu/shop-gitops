@@ -71,6 +71,28 @@ func main() {
 
 	go outbox.Run(ctx, log, st, brk, 2*time.Second)
 
+	// 队列深度和 outbox 积压没有天然的 Prometheus 数据源，
+	// 只能主动采样。15s 一次，够告警用，也不会把 broker 打疼。
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if depth, err := brk.QueueDepth(broker.QueueOrderCreated); err == nil {
+				obs.QueueDepth.Set(float64(depth))
+			}
+			sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if n, err := st.CountOutboxPending(sctx); err == nil {
+				obs.OutboxPending.Set(float64(n))
+			}
+			cancel()
+		}
+	}()
+
 	host, _ := os.Hostname()
 	srv := &api.Server{Log: log, Store: st, Cache: c, Broker: brk, Cfg: cfg, Pod: host}
 

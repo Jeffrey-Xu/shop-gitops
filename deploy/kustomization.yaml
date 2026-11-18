@@ -7,6 +7,8 @@ resources:
   - worker.yaml
   - frontend.yaml
   - ingress.yaml
+  # 告警规则；ServiceMonitor 跟着各自的服务放在 api.yaml / worker.yaml 里
+  - monitoring.yaml
 # CI 会改写这里，把 tag 换成当前 commit sha
 # api 和 worker 用的是同一个 backend 镜像，所以只需要两条
 images:

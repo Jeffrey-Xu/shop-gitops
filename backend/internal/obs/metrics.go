@@ -45,7 +45,12 @@ var (
 
 	QueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "shop_queue_depth",
-		Help: "主队列积压消息数（每次 /api/stats 或指标抓取时采样）",
+		Help: "主队列积压消息数（每 15s 采样一次）",
+	})
+
+	OutboxPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shop_outbox_pending",
+		Help: "已写入但尚未投递的 outbox 行数（每 15s 采样一次）",
 	})
 )
 

@@ -42,3 +42,11 @@ func (s *Store) MarkOutboxFailed(ctx context.Context, id int64) error {
 		`UPDATE outbox SET attempts = attempts + 1 WHERE id = $1`, id)
 	return err
 }
+
+// CountOutboxPending 给告警用：这个数持续上涨说明 relay 或 broker 出问题了。
+func (s *Store) CountOutboxPending(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT count(*) FROM outbox WHERE published_at IS NULL`).Scan(&n)
+	return n, err
+}
