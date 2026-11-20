@@ -67,6 +67,14 @@ jobs:
   bump:
     needs: build
     runs-on: ubuntu-latest
+    # 两次 push 挨得近时，两个 bump 会各改同一个文件，后推的必然被
+    # `! [rejected] main -> main (fetch first)` 打回。串行化 bump：
+    # 后来的排队（pending 只有一个位，新的顶掉旧的——这正是想要的，
+    # 最新的 sha 才是该生效的那个）；cancel-in-progress=false 保证
+    # 正在跑的那个不会被拦腰掐断。
+    concurrency:
+      group: bump-deploy
+      cancel-in-progress: false
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -87,14 +95,44 @@ jobs:
           yq '.images' deploy/kustomization.yaml
 
       - name: 提交回仓库
+        env:
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deploy/kustomization.yaml
-          if git diff --staged --quiet; then
-            echo "没有变化，跳过提交"
-            exit 0
-          fi
-          git commit -m "chore(deploy): bump images to ${{ github.sha }} [skip ci]"
-          git push
+
+          PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
+          subst() {
+            for svc in backend frontend fulfillment; do
+              yq -i "(.images[] | select(.name == \"${PREFIX}/${svc}\") | .newTag) = \"${SHA}\"" deploy/kustomization.yaml
+            done
+          }
+
+          # 返回 1 表示没有变化（重跑同一个 sha 时会这样）
+          try_commit() {
+            git add deploy/kustomization.yaml
+            git diff --staged --quiet && return 1
+            git commit -m "chore(deploy): bump images to ${SHA} [skip ci]"
+          }
+
+          for i in 1 2 3 4 5; do
+            if ! try_commit; then
+              echo "没有变化，跳过提交"
+              exit 0
+            fi
+            if git push; then
+              echo "推送成功（第 ${i} 次尝试）"
+              exit 0
+            fi
+
+            # 被拒说明远端又前进了（另一个 bump 刚落地）。硬对齐远端再重算一次
+            # tag：`reset --hard` 会丢掉上一步的替换，所以 subst 必须重跑。
+            echo "第 ${i} 次推送被拒，对齐远端后重试"
+            git fetch origin main
+            git reset --hard origin/main
+            subst
+            sleep $((i * 3))
+          done
+          echo "重试 5 次仍失败，请人工处理"
+          exit 1
