@@ -42,6 +42,15 @@ spec:
             replicas: 1
             retention: 7d
             retentionSize: 4GB
+            # RabbitMQ 跑在宿主机（brew services），不在集群里，ServiceMonitor 选不到它的 Endpoint。
+            # 15692 是 rabbitmq_prometheus 插件直接吐 Prometheus 格式的端口，这里用静态目标抓。
+            # host.docker.internal 由 Docker Desktop 注入，Pod 内可直接解析（已用 curl 验证 200）。
+            additionalScrapeConfigs:
+              - job_name: rabbitmq
+                metrics_path: /metrics
+                static_configs:
+                  - targets:
+                      - host.docker.internal:15692
             # 单副本不重建 PVC，删了数据就没了，本地可接受
             resources:
               requests:
@@ -61,6 +70,26 @@ spec:
 
         alertmanager:
           enabled: true
+          # 默认 receiver 是 null —— 规则会 fire，但谁也不会收到通知。
+          # 这里投到集群内的 mailpit，浏览器 http://mailpit.localhost 直接能看邮件。
+          config:
+            global:
+              smtp_smarthost: mailpit.monitoring.svc.cluster.local:1025
+              smtp_from: alertmanager@shop.local
+              # mailpit 不做 TLS，Alertmanager 默认强制 STARTTLS，必须关掉
+              smtp_require_tls: false
+            route:
+              receiver: mailpit
+              group_by: [alertname, namespace]
+              group_wait: 10s
+              group_interval: 1m
+              # 演练时别刷屏：同一个告警 4 小时内只重发一次
+              repeat_interval: 4h
+            receivers:
+              - name: mailpit
+                email_configs:
+                  - to: oncall@shop.local
+                    send_resolved: true
           alertmanagerSpec:
             replicas: 1
             resources:

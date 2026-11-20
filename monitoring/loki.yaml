@@ -34,12 +34,22 @@ spec:
                   prefix: loki_index_
                   period: 24h
           limits_config:
-            # 0 = 永久保留。本地磁盘 940G 空余，先不折腾 compactor 删数据那条链
-            retention_period: 0
+            # 之前是 0（永久保留），磁盘只会涨不会落。
+            # 168h = 7 天，和 Prometheus 的 retention 对齐，排查窗口一致。
+            # 注意：retention_period 只是“标记可删”，真正执行删除的是 compactor，
+            # 所以下面还必须开 retention_enabled 并指定 delete_request_store。
+            retention_period: 168h
             reject_old_samples: true
             reject_old_samples_max_age: 168h
             allow_structured_metadata: true
             volume_enabled: true
+          # 删除动作的实际执行者。少任何一个字段 Loki 都会启动失败：
+          # delete_request_store 未配置时报 "invalid compactor config"
+          compactor:
+            retention_enabled: true
+            delete_request_store: filesystem
+            compaction_interval: 10m
+            retention_delete_delay: 2h
 
         singleBinary:
           replicas: 1

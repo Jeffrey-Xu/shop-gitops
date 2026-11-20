@@ -1,0 +1,17 @@
+# 观测侧的“补件”：本地邮件接收器 + 宿主中间件 exporter + 业务大盘
+# 独立成一个 Application，避免和 helm 管的三个大件（kps/loki/alloy）混在一条同步链里
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: monitoring
+resources:
+  - mailpit.yaml
+  - exporters.yaml
+configMapGenerator:
+  - name: grafana-dashboard-shop
+    files:
+      - dashboards/shop-overview.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+      # 不带 hash 后缀，方便在 Grafana 里按名字引用，也方便 kubectl get cm 时直接找
+      disableNameSuffixHash: false
