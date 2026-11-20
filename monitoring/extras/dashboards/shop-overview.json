@@ -533,7 +533,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "fulfillment_orders_in_flight",
+          "expr": "sum(fulfillment_orders_in_flight)",
           "legendFormat": "未签收"
         }
       ],
