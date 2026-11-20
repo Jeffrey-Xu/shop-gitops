@@ -34,7 +34,7 @@
 | `backend/cmd/backfill/` | 一次性运维工具：给「已 PAID 但无 `order.paid` 事件」的存量订单补 outbox，默认 dry-run |
 | `backend/internal/` | `config` `obs` `httpx` `cache` `store` `broker` `outbox` `api` `worker` `account` `auth` `payment` |
 | `backend/internal/store/migrations/` | `go:embed` 的 SQL 迁移，启动时同步执行，失败即退出 |
-| `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管 |
+| `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管。`src/art.js` 画商品矢量图，`src/cart.js` 管购物车，`src/api.js` 收口所有请求 |
 | `payment-service/` | Python 3.12 + FastAPI，模拟第三方支付网关（幂等扣款 + 落库 + 回查） |
 | `fulfillment-service/` | Node 22 + Fastify，消费 `order.paid`，建发货单、推进物流、回写订单 |
 | `deploy/` | Kustomize：namespace、api/worker/account/frontend/payment/fulfillment、ingress、monitoring |
@@ -49,9 +49,10 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/hello` | 返回 Pod 名与版本，验证分流 |
-| GET | `/api/products` | 商品列表，走 Redis，响应头带 `X-Cache: HIT\|MISS` |
+| GET | `/api/products` | 商品列表，走 Redis，响应头带 `X-Cache: HIT\|MISS`。支持 `?category=` `?q=` `?sort=sales\|price_asc\|price_desc\|rating`，响应里带 `categories`（品类+数量）和 `total`/`catalog` |
 | GET | `/api/products/{id}` | 单商品 |
-| POST | `/api/orders` | 下单，扣库存 + 建单 + 写 outbox，一个事务 |
+| POST | `/api/orders` | 下单，扣库存 + 建单 + 写 outbox，一个事务。支持 **一单多品**：`{"items":[{"productId":1,"quantity":2},…]}`；旧的 `{"productId":1,"quantity":1}` 仍然可用 |
+| GET | `/api/orders` | **需登录**：当前用户自己的订单列表（含明细与状态历史），只按 token 里的 uid 查 |
 | GET | `/api/orders/{id}` | 订单详情含状态迁移历史 |
 | GET | `/api/stats` | 缓存命中率、队列深度、各状态订单数，前端 footer 用 |
 | POST | `/api/dev/fault?type=panic\|slow\|error` | 故障注入，仅 `DEV_MODE=true` 时存在 |
@@ -97,7 +98,8 @@ curl -s http://localhost/auth/me -H "Authorization: Bearer $TOKEN"
 # 带 token 下单 → 订单归属到这个用户；不带也能下单（匿名）
 curl -s -X POST http://localhost/api/orders -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $(uuidgen)" \
-  -d '{"productId":1,"quantity":1}' | jq '{id,userId,status}'
+  -d '{"items":[{"productId":1,"quantity":1},{"productId":15,"quantity":3}]}' \
+  | jq '{id,userId,status,totalCents,items}'
 ```
 
 履约服务（集群内 `svc/fulfillment:8080`，集群外走 `/fulfill` 前缀）：
@@ -247,11 +249,46 @@ DATABASE_URL=postgres://shop:***@127.0.0.1:5432/shop?sslmode=disable \
 
 实测结果：31 张单写入后 **50 秒内**全部走完 `PAID → SHIPPED → DELIVERED`，最终 36 张发货单对 36 张唯一订单，无重复事件，`PAID` 归零。
 
+## 店面：前端这一层做了什么
+
+页面从「三张卡片 + 一个下单按钮」变成了能逛的店：吸顶导航、品类筛选、搜索、排序、
+商品详情、购物车抽屉、结算、实时状态时间轴、我的订单。几个决定值得写下来。
+
+**1. 商品图是矢量画的，不是图片文件。**
+商品表里存的是 `art` 这个标识（`keyboard`/`chair`/…），不是图片 URL。前端的 `src/art.js`
+按标识现画 SVG。理由有三条：这个集群经常拉不到外部图床，图片一挂就是一片灰块；
+矢量图跟 CSS 一起进包，离线永远画得出来；换主题色不用重新出图。
+把「画法」放在前端而不是数据库里，也避免商品数据里混进构建产物路径（换 CDN 就要改数据）。
+
+**2. 筛选在内存里做，不往 SQL 下推。**
+`/api/products?category=&q=&sort=` 的过滤发生在 Go 里，发生在缓存之后。这样缓存键仍然只有
+`shop:products:list` 一个：按 category 做缓存键会让键数量爆炸，而且下单后的失效逻辑要跟着改
+（现在只删一个键）。目录只有十几行的前提下，全量反序列化的开销可以忽略。
+目录涨到几百行、或者要接搜索引擎时，这个决定就该反过来。
+
+**3. 购物车只存 `{id, qty}`，不存价格。**
+价格必须每次从后端拿。存下来就会遇到「改价之后购物车里还是旧价」，结算金额和商品页对不上。
+商品下架时不静默删除，而是标出来让用户自己移除——金额变了得让人知道为什么。
+
+**4. 幂等键和「这一次点击」绑定，在调用处生成。**
+放在 `api.createOrder` 里生成的话，网络超时重试会换一个键，等于没有幂等。
+
+**5. 状态时间轴读的是 `order_events`，不是前端推算的。**
+四步（已提交 / 已支付 / 已发货 / 已签收）的完成状态和每步时间都来自 `history` 数组，
+前端只负责翻译。前端自己按 status 猜的话，出现「SHIPPED 但没有 SHIPPED 事件」这种脏数据时
+界面会撒谎。终态不再高亮成「进行中」——已完成还亮橙色会被读成出事了。
+
+**6. 路由用 hash，两页不值得引 router 库。**
+收益是刷新不丢页面（`#/orders` 可以直接分享）。代价是不能做 SSR，这个站不需要。
+
+结算走一单多品，`POST /api/orders` 一次提交整个购物车。部分成交需要「部分退款 + 部分发货」的
+模型，复杂度不成比例，所以后端语义是**要么全成要么全不成**：任何一行库存不足，整单回滚。
+
 ## 数据模型
 
 | 表 | 关键字段 | 说明 |
 |---|---|---|
-| `products` | `price_cents INT`、`stock`、`version` | 金额用整数分，不用浮点 |
+| `products` | `price_cents BIGINT`、`stock`、`version`；展示字段 `description` / `category` / `art` / `rating` / `sold` / `original_price_cents` | 金额用整数分，不用浮点。`art` 是前端插画标识，不是图片 URL |
 | `orders` | `status`、`total_cents`、`idempotency_key UNIQUE`、`user_id`、`tracking_no` | 状态机 `CREATED → PAID → SHIPPED → DELIVERED`，另支 `CANCELLED` |
 | `order_items` | `unit_price_cents` | 下单时快照单价，改价不影响历史单 |
 | `order_events` | `from_status`、`to_status`、`UNIQUE(order_id,to_status)` | 状态迁移审计，日志之外的第二证据 |
@@ -261,6 +298,9 @@ DATABASE_URL=postgres://shop:***@127.0.0.1:5432/shop?sslmode=disable \
 | `shipments` | `order_id UNIQUE`、`tracking_no`、`status`、`next_advance_at` | 履约服务拥有 |
 
 **库存只在 PostgreSQL 扣，Redis 不参与扣减。** 缓存只负责读得快，一致性交给数据库。
+
+一单多品的扣减按 `product_id` 升序逐行执行，让并发下单的加锁顺序一致——不然 A 单锁 1 再锁 2、
+B 单锁 2 再锁 1，就是教科书式的死锁。任何一行库存不足就整单回滚，不做部分成交。
 
 `orders` 上有三处细节值得注意：
 
@@ -509,7 +549,7 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - 单副本、无 HPA/PDB、无 NetworkPolicy
 - `Idempotency-Key` 仍由前端生成，服务端不校验格式
 - ~~**存量订单不会自动发货**~~：已修。`backend/cmd/backfill` 给「PAID 且无 `order.paid` 事件」的订单补 outbox，实测 31 张单全部补发到位。做法见「支付之后：从 PAID 到 DELIVERED」小节
-- 没有「我的订单」列表接口，账号只解决了归属，没解决查询
+- ~~没有「我的订单」列表接口~~：已加 `GET /api/orders`，只按 token 里的 uid 查，明细和状态历史用两条 `= ANY($1)` 批量补齐，不做 N+1。仍然没有分页——订单多了要改游标，offset 会漏单
 - JWT 无法吊销：纯无状态，退出登录只是前端删 token。要立刻失效得上黑名单或 RS256 + 短 access + refresh
 - 前端 token 存 `localStorage`，XSS 可直接读走
 - 支付镜像是本地 `docker build` 的 `local1` tag，没走 CI；集群重置后要重新 build 并导入节点（`docker save | docker exec -i desktop-worker ctr -n k8s.io images import -`）

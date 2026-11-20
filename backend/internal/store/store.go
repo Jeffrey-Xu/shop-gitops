@@ -24,6 +24,12 @@ var (
 	ErrProductNotFound = errors.New("product not found")
 	ErrOutOfStock      = errors.New("out of stock")
 	ErrOrderNotFound   = errors.New("order not found")
+
+	// 下单请求本身的形状问题。分开定义是为了让 API 层能回 400
+	// 而不是把参数错误混进 500 里 —— 两者对调用方的含义完全不同。
+	ErrEmptyCart       = errors.New("order has no lines")
+	ErrInvalidProduct  = errors.New("invalid product id")
+	ErrInvalidQuantity = errors.New("invalid quantity")
 )
 
 type Store struct {

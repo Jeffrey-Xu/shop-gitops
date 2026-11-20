@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -12,42 +13,68 @@ import (
 // CreateOrder 是整个写路径的核心：
 // 扣库存、建订单、记审计、写 outbox —— 全部在同一个事务里。
 // 返回的 bool 表示"是否新建"，false 说明命中了幂等键、返回的是已有订单。
+//
+// 一单多品时逐行扣库存。任何一行库存不足就整单回滚 ——
+// 部分成交需要「部分退款 + 部分发货」的模型，那是另一个量级的复杂度，
+// 电商的默认语义也是要么全成要么全不成。
 func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bool, error) {
+	lines, err := p.Normalize()
+	if err != nil {
+		return Order{}, false, err
+	}
+
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Order{}, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var (
-		priceCents int64
-		name       string
-	)
-	// 条件更新 + RETURNING：一条语句同时完成「校验库存」和「扣减」，
-	// 没有 SELECT 完再 UPDATE 的竞态窗口。
-	err = tx.QueryRowContext(ctx, `
-		UPDATE products
-		   SET stock      = stock - $1,
-		       version    = version + 1,
-		       updated_at = now()
-		 WHERE id = $2 AND stock >= $1
-		RETURNING price_cents, name`, p.Quantity, p.ProductID).Scan(&priceCents, &name)
-	if errors.Is(err, sql.ErrNoRows) {
-		var exists bool
-		if e := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM products WHERE id = $1)`, p.ProductID).Scan(&exists); e != nil {
-			return Order{}, false, e
-		}
-		if !exists {
-			return Order{}, false, ErrProductNotFound
-		}
-		return Order{}, false, ErrOutOfStock
-	}
-	if err != nil {
-		return Order{}, false, err
-	}
+	// 按 product_id 升序扣减，让并发下单的加锁顺序一致。
+	// 不排序的话，A 单锁 1 再锁 2、B 单锁 2 再锁 1，就是教科书式的死锁。
+	// Normalize 已经按首次出现顺序排好了，这里再拍一次 id 序。
+	ordered := make([]OrderLine, len(lines))
+	copy(ordered, lines)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ProductID < ordered[j].ProductID })
 
-	totalCents := priceCents * int64(p.Quantity)
+	items := make([]OrderItem, 0, len(ordered))
+	var totalCents int64
+	for _, l := range ordered {
+		var (
+			priceCents int64
+			name       string
+		)
+		// 条件更新 + RETURNING：一条语句同时完成「校验库存」和「扣减」，
+		// 没有 SELECT 完再 UPDATE 的竞态窗口。
+		err = tx.QueryRowContext(ctx, `
+			UPDATE products
+			   SET stock      = stock - $1,
+			       version    = version + 1,
+			       updated_at = now()
+			 WHERE id = $2 AND stock >= $1
+			RETURNING price_cents, name`, l.Quantity, l.ProductID).Scan(&priceCents, &name)
+		if errors.Is(err, sql.ErrNoRows) {
+			var exists bool
+			if e := tx.QueryRowContext(ctx,
+				`SELECT EXISTS(SELECT 1 FROM products WHERE id = $1)`, l.ProductID).Scan(&exists); e != nil {
+				return Order{}, false, e
+			}
+			if !exists {
+				return Order{}, false, ErrProductNotFound
+			}
+			return Order{}, false, ErrOutOfStock
+		}
+		if err != nil {
+			return Order{}, false, err
+		}
+
+		items = append(items, OrderItem{
+			ProductID:      l.ProductID,
+			Name:           name,
+			Quantity:       l.Quantity,
+			UnitPriceCents: priceCents,
+		})
+		totalCents += priceCents * int64(l.Quantity)
+	}
 
 	var orderID int64
 	err = tx.QueryRowContext(ctx, `
@@ -67,11 +94,13 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 		return Order{}, false, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO order_items (order_id, product_id, name, quantity, unit_price_cents)
-		VALUES ($1, $2, $3, $4, $5)`,
-		orderID, p.ProductID, name, p.Quantity, priceCents); err != nil {
-		return Order{}, false, err
+	for _, it := range items {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO order_items (order_id, product_id, name, quantity, unit_price_cents)
+			VALUES ($1, $2, $3, $4, $5)`,
+			orderID, it.ProductID, it.Name, it.Quantity, it.UnitPriceCents); err != nil {
+			return Order{}, false, err
+		}
 	}
 
 	// from_status 用空串表示「订单刚创建，还没有前一个状态」
@@ -81,11 +110,16 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 		return Order{}, false, err
 	}
 
+	// ProductID / Quantity 保留第一个商品：worker 只拿它们打日志，
+	// 真正扣多少钱看 TotalCents。事件里多带一个 Items 是为了让下游
+	// 不必回查订单表也能知道买了什么。
+	first := items[0]
 	payload, err := json.Marshal(OrderCreatedEvent{
 		OrderID:    orderID,
-		ProductID:  p.ProductID,
-		Quantity:   p.Quantity,
+		ProductID:  first.ProductID,
+		Quantity:   first.Quantity,
 		TotalCents: totalCents,
+		Items:      items,
 	})
 	if err != nil {
 		return Order{}, false, err
@@ -128,6 +162,120 @@ func (s *Store) GetOrder(ctx context.Context, id int64) (Order, error) {
 		return Order{}, err
 	}
 	return o, nil
+}
+
+// ListOrdersByUser 返回某个用户的订单，按时间倒序。
+//
+// 明细和事件用两条 `= ANY($1)` 的批量查询补齐，而不是每单各查一次 ——
+// 20 单的话 N+1 就是 41 次往返，在列表页上是能感觉到的。
+//
+// 刻意不带分页：演示目录的订单量很小，加 offset/limit 要连带把「我的订单」
+// 前端改成翻页，收益不成比例。真要做的话游标比 offset 更稳（订单随时在新增，
+// offset 翻页会漏单）。
+func (s *Store) ListOrdersByUser(ctx context.Context, userID int64, limit int) ([]Order, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, user_id, status, total_cents, tracking_no, created_at, updated_at
+		  FROM orders
+		 WHERE user_id = $1
+		 ORDER BY id DESC
+		 LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	orders := make([]Order, 0, limit)
+	ids := make([]int64, 0, limit)
+	for rows.Next() {
+		var (
+			o          Order
+			uid        sql.NullInt64
+			trackingNo sql.NullString
+		)
+		if err := rows.Scan(&o.ID, &uid, &o.Status, &o.TotalCents,
+			&trackingNo, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			return nil, err
+		}
+		o.UserID = uid.Int64
+		o.TrackingNo = trackingNo.String
+		orders = append(orders, o)
+		ids = append(ids, o.ID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return orders, nil
+	}
+
+	itemsByOrder, err := s.orderItemsBatch(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	historyByOrder, err := s.orderHistoryBatch(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range orders {
+		orders[i].Items = itemsByOrder[orders[i].ID]
+		orders[i].History = historyByOrder[orders[i].ID]
+		if orders[i].Items == nil {
+			orders[i].Items = []OrderItem{}
+		}
+		if orders[i].History == nil {
+			orders[i].History = []OrderEvent{}
+		}
+	}
+	return orders, nil
+}
+
+func (s *Store) orderItemsBatch(ctx context.Context, ids []int64) (map[int64][]OrderItem, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT order_id, product_id, name, quantity, unit_price_cents
+		  FROM order_items WHERE order_id = ANY($1) ORDER BY order_id, id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64][]OrderItem, len(ids))
+	for rows.Next() {
+		var (
+			orderID int64
+			it      OrderItem
+		)
+		if err := rows.Scan(&orderID, &it.ProductID, &it.Name, &it.Quantity, &it.UnitPriceCents); err != nil {
+			return nil, err
+		}
+		out[orderID] = append(out[orderID], it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) orderHistoryBatch(ctx context.Context, ids []int64) (map[int64][]OrderEvent, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT order_id, from_status, to_status, note, created_at
+		  FROM order_events WHERE order_id = ANY($1) ORDER BY order_id, id`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64][]OrderEvent, len(ids))
+	for rows.Next() {
+		var (
+			orderID int64
+			e       OrderEvent
+		)
+		if err := rows.Scan(&orderID, &e.FromStatus, &e.ToStatus, &e.Note, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out[orderID] = append(out[orderID], e)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) GetOrderByIdempotencyKey(ctx context.Context, key string) (Order, error) {

@@ -24,7 +24,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shop
 data:
-  APP_VERSION: "v3-payment"
+  APP_VERSION: "v5-catalog"
   LOG_LEVEL: "info"
   CACHE_TTL: "30s"
   # 打开后才注册 /api/dev/fault（演示错误率和日志链路用）

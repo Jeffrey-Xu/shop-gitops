@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +44,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/products", s.handleProducts)
 	mux.HandleFunc("GET /api/products/{id}", s.handleProduct)
 	mux.HandleFunc("POST /api/orders", s.handleCreateOrder)
+	// 注意顺序：Go 1.22 的 mux 按模式具体度匹配，/api/orders 和
+	// /api/orders/{id} 不会互相抢，注册先后无所谓。
+	mux.HandleFunc("GET /api/orders", s.requireAuth(s.handleMyOrders))
 	mux.HandleFunc("GET /api/orders/{id}", s.handleGetOrder)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/dev/fault", s.handleFault)
@@ -71,6 +75,47 @@ func (s *Server) withOptionalAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))
 	})
+}
+
+// requireAuth 是「必须登录」。它不自己解析 token ——
+// 外面那层 withOptionalAuth 已经把合法 claims 放进 ctx 了，
+// 这里只判断「有没有」。两处各解析一次容易写出不一致的判定。
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := auth.FromContext(r.Context()); !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "需要登录"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// handleMyOrders 返回当前登录用户的订单。
+//
+// 只按 token 里的 uid 查，不接受 userId 查询参数 ——
+// 收参数就等于给了越权入口，而「我的订单」根本不需要这个能力。
+func (s *Server) handleMyOrders(w http.ResponseWriter, r *http.Request) {
+	claims, ok := auth.FromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "需要登录"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	limit := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	orders, err := s.Store.ListOrdersByUser(ctx, claims.UserID, limit)
+	if err != nil {
+		s.Log.Error("list_orders_failed", "err", err, "user_id", claims.UserID)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "查询订单失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": orders, "total": len(orders)})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +149,13 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 
 // handleProducts 是 cache-aside 的教科书形状：
 // 先查缓存 → 未命中回源 → 写回缓存。并发未命中由 singleflight 合并。
+//
+// 筛选和排序都在内存里做，不往 SQL 下推，原因是：
+//   - 目录只有十几行，全量反序列化不到的耗时可忽略；
+//   - 缓存键保持唯一（shop:products:list）。按 category/q 做缓存键会爆炸，
+//     而且下单后的失效逻辑要跟着改（现在只删一个键）。
+//
+// 目录涨到几百行、或者要接搜索引擎时，这个决定就该反过来。
 func (s *Server) handleProducts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
@@ -113,35 +165,98 @@ func (s *Server) handleProducts(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.Log.Warn("cache_get_failed", "key", cache.KeyProductList, "err", err)
 	}
-	if hit {
-		s.markCache(ctx, w, "hit")
-		writeJSON(w, http.StatusOK, map[string]any{"items": items, "pod": s.Pod, "cache": "hit"})
-		return
-	}
-
-	v, err := s.Cache.Do(cache.KeyProductList, func() (any, error) {
-		list, err := s.Store.ListProducts(ctx)
+	cacheState := "hit"
+	if !hit {
+		v, err := s.Cache.Do(cache.KeyProductList, func() (any, error) {
+			list, err := s.Store.ListProducts(ctx)
+			if err != nil {
+				return nil, err
+			}
+			// 用 WithoutCancel：即使首个请求的客户端断开，也把结果写回缓存，
+			// 否则这次回源就白跑了。
+			_ = s.Cache.SetJSON(context.WithoutCancel(ctx), cache.KeyProductList, list)
+			return list, nil
+		})
 		if err != nil {
-			return nil, err
+			s.Log.Error("list_products_failed", "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "查询商品失败"})
+			return
 		}
-		// 用 WithoutCancel：即使首个请求的客户端断开，也把结果写回缓存，
-		// 否则这次回源就白跑了。
-		_ = s.Cache.SetJSON(context.WithoutCancel(ctx), cache.KeyProductList, list)
-		return list, nil
-	})
-	if err != nil {
-		s.Log.Error("list_products_failed", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "查询商品失败"})
-		return
+		list, ok := v.([]store.Product)
+		if !ok {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "缓存类型异常"})
+			return
+		}
+		items = list
+		cacheState = "miss"
 	}
 
-	list, ok := v.([]store.Product)
-	if !ok {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "缓存类型异常"})
-		return
+	// 品类清单从全量数据算出来，不写死在前端 ——
+	// 前端硬编码一份的话，加品类就得两边一起发版。
+	counts := map[string]int{}
+	for _, p := range items {
+		counts[p.Category]++
 	}
-	s.markCache(ctx, w, "miss")
-	writeJSON(w, http.StatusOK, map[string]any{"items": list, "pod": s.Pod, "cache": "miss"})
+	categories := make([]map[string]any, 0, len(counts))
+	for name, n := range counts {
+		categories = append(categories, map[string]any{"name": name, "count": n})
+	}
+	// map 遍历顺序是随机的，数量相同的品类每次请求都会换位置，
+	// 前端 chips 就会跳来跳去。必须给一个确定的全序：数量优先，其次名字。
+	sort.Slice(categories, func(i, j int) bool {
+		ci, cj := categories[i]["count"].(int), categories[j]["count"].(int)
+		if ci != cj {
+			return ci > cj
+		}
+		return categories[i]["name"].(string) < categories[j]["name"].(string)
+	})
+
+	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	cat := strings.TrimSpace(r.URL.Query().Get("category"))
+
+	// 先按品类和关键词收窄，再排序：排序是对结果的排序，
+	// 反过来的话每个排序分支都要重写一遍过滤逻辑。
+	filtered := make([]store.Product, 0, len(items))
+	for _, p := range items {
+		if cat != "" && p.Category != cat {
+			continue
+		}
+		if q != "" &&
+			!strings.Contains(strings.ToLower(p.Name), q) &&
+			!strings.Contains(strings.ToLower(p.Description), q) {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+
+	switch r.URL.Query().Get("sort") {
+	case "price_asc":
+		sort.SliceStable(filtered, func(i, j int) bool {
+			return filtered[i].PriceCents < filtered[j].PriceCents
+		})
+	case "price_desc":
+		sort.SliceStable(filtered, func(i, j int) bool {
+			return filtered[i].PriceCents > filtered[j].PriceCents
+		})
+	case "sales":
+		sort.SliceStable(filtered, func(i, j int) bool {
+			return filtered[i].Sold > filtered[j].Sold
+		})
+	case "rating":
+		sort.SliceStable(filtered, func(i, j int) bool {
+			return filtered[i].Rating > filtered[j].Rating
+		})
+	}
+
+	s.markCache(ctx, w, cacheState)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":      filtered,
+		"total":      len(filtered),
+		"catalog":    len(items),
+		"categories": categories,
+		"pod":        s.Pod,
+		"cache":      cacheState,
+	})
 }
 
 func (s *Server) handleProduct(w http.ResponseWriter, r *http.Request) {
@@ -181,17 +296,29 @@ func (s *Server) handleProduct(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
+	// 同时接受两种请求体：
+	//   {"items":[{"productId":1,"quantity":2}, ...]}   一单多品
+	//   {"productId":1,"quantity":2}                    旧的单商品格式
+	// 老前端在滚动更新期间还会打后者，直接拒绝会砸出 400。
 	var req struct {
-		ProductID int64 `json:"productId"`
-		Quantity  int   `json:"quantity"`
+		Items     []store.OrderLine `json:"items"`
+		ProductID int64             `json:"productId"`
+		Quantity  int               `json:"quantity"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
 		return
 	}
-	if req.Quantity <= 0 {
+	if len(req.Items) == 0 && req.Quantity <= 0 {
 		req.Quantity = 1
+	}
+	// 单行上限 99：这不是业务规则，是防止有人一个请求把库存扫空。
+	for _, it := range req.Items {
+		if it.Quantity > 99 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "单件商品最多购买 99 件"})
+			return
+		}
 	}
 	if req.Quantity > 99 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "单次最多购买 99 件"})
@@ -209,12 +336,18 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	order, created, err := s.Store.CreateOrder(ctx, store.CreateOrderParams{
+		Items:          req.Items,
 		ProductID:      req.ProductID,
 		Quantity:       req.Quantity,
 		IdempotencyKey: strings.TrimSpace(r.Header.Get("Idempotency-Key")),
 		UserID:         userID,
 	})
 	switch {
+	case errors.Is(err, store.ErrEmptyCart),
+		errors.Is(err, store.ErrInvalidProduct),
+		errors.Is(err, store.ErrInvalidQuantity):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "订单内容不合法"})
+		return
 	case errors.Is(err, store.ErrProductNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "商品不存在"})
 		return
@@ -223,7 +356,8 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "库存不足", "pod": s.Pod})
 		return
 	case err != nil:
-		s.Log.Error("create_order_failed", "err", err, "product_id", req.ProductID, "quantity", req.Quantity)
+		s.Log.Error("create_order_failed", "err", err,
+			"product_id", req.ProductID, "quantity", req.Quantity, "lines", len(req.Items))
 		obs.OrdersCreated.WithLabelValues("error").Inc()
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "下单失败"})
 		return
