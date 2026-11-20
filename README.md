@@ -31,6 +31,7 @@
 | `backend/cmd/api/` | HTTP 服务入口，另起一个 outbox relay 协程 |
 | `backend/cmd/worker/` | RabbitMQ 消费者入口，负责扣款（管钱） |
 | `backend/cmd/account/` | 账号服务入口，注册/登录/签发 JWT |
+| `backend/cmd/backfill/` | 一次性运维工具：给「已 PAID 但无 `order.paid` 事件」的存量订单补 outbox，默认 dry-run |
 | `backend/internal/` | `config` `obs` `httpx` `cache` `store` `broker` `outbox` `api` `worker` `account` `auth` `payment` |
 | `backend/internal/store/migrations/` | `go:embed` 的 SQL 迁移，启动时同步执行，失败即退出 |
 | `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管 |
@@ -214,6 +215,37 @@ try {
 回滚是安全的，因为 **api 侧的回写是幂等的**：`WHERE status = <前置状态>` 加 `order_events` 的唯一约束，重复回写只会返回 `duplicate`。
 
 失败分类和 worker 那边是同一套逻辑：`4xx` = 请求本身有问题，重试没意义；`5xx` / 超时 / 连不上 = 值得再试。
+
+### 存量订单：补 `order.paid` 事件
+
+履约服务是后加的，它上线之前 worker 扣款成功只把订单改成 `PAID`，**没有写 `order.paid` 事件**。这批单会永久停在 `PAID`——钱收了，货永远不发。本仓库实测时就撞上了 31 张。
+
+`backend/cmd/backfill` 用来补这个洞：
+
+```bash
+# 先看要补哪些，默认 dry-run，不改数据
+DATABASE_URL=postgres://shop:***@127.0.0.1:5432/shop?sslmode=disable \
+  go run ./cmd/backfill
+
+# 确认无误后写入
+  ... go run ./cmd/backfill -apply
+```
+
+它**只往 `outbox` 插记录，绝不直接 `UPDATE orders`**。原因：`orders` 只允许一个写入口，直接改状态会绕过状态机和 `order_events` 审计。补 outbox 等于「让这些单重新走一遍正常链路」——relay → `shop.order.paid` → fulfillment 建单 → 逐步推进 → 回写订单，每一步都是既有逻辑，没有新增特殊路径。
+
+三处防重：
+
+| 条件 | 挡住什么 |
+|---|---|
+| `status = 'PAID'` | 已推进到 SHIPPED/DELIVERED 的单 |
+| `NOT EXISTS` outbox 里同 `orderId` 的 `order.paid` | 已经被补过、或本来就正常收到事件的单 |
+| `NOT EXISTS` `order_events` 里的 `SHIPPED` | 正在履约途中、只是还没回写完的单 |
+
+写入时每条再判一次 `NOT EXISTS`（扫表和写入之间有窗口），重复的 `order.paid` 虽然不会造成重复发货（`createShipment` 是 `ON CONFLICT DO NOTHING`），但没必要制造噪音。
+
+支付号从 `order_events` 的 note 里正则捞（worker 当初写的是 `worker: payment captured (pay_xxx)`），捞不到就留空——不编造。
+
+实测结果：31 张单写入后 **50 秒内**全部走完 `PAID → SHIPPED → DELIVERED`，最终 36 张发货单对 36 张唯一订单，无重复事件，`PAID` 归零。
 
 ## 数据模型
 
@@ -476,7 +508,7 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - `CreateOrder` 提交后又回查三次拿详情，多两次往返
 - 单副本、无 HPA/PDB、无 NetworkPolicy
 - `Idempotency-Key` 仍由前端生成，服务端不校验格式
-- **存量订单不会自动发货**：`order.paid` 事件是这次新加的，此前已经 `PAID` 的订单在 `outbox` 里没有对应记录，会永远停在 PAID。真实项目要做一次回填（扫 PAID 且没有 shipments 的订单，补发事件），这里没做
+- ~~**存量订单不会自动发货**~~：已修。`backend/cmd/backfill` 给「PAID 且无 `order.paid` 事件」的订单补 outbox，实测 31 张单全部补发到位。做法见「支付之后：从 PAID 到 DELIVERED」小节
 - 没有「我的订单」列表接口，账号只解决了归属，没解决查询
 - JWT 无法吊销：纯无状态，退出登录只是前端删 token。要立刻失效得上黑名单或 RS256 + 短 access + refresh
 - 前端 token 存 `localStorage`，XSS 可直接读走
