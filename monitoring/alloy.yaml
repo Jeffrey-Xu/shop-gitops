@@ -102,11 +102,11 @@ spec:
                 }
 
                 // 注意：不要在这里加 stage.template 去统一 level 大小写。
-                // Alloy 的模板是 Go template，Helm 渲染 values 时也会解析 {{ }}，
-                // 直接写会变成 helm 的模板报错（alloy app 会卡在
-                // "failed to generate manifest"）。大小写统一放在产生日志的一端：
-                // internal/obs/log.go 的 ReplaceAttr 已经输出小写 level，
-                // Python 和 Node 本来也是小写。
+                // Alloy 的模板是 Go template，而 Helm 渲染 values 时也会解析
+                // 双花括号 —— 连注释里出现都会报 "missing value for command"，
+                // 整个 alloy app 卡在 failed to generate manifest。
+                // 大小写统一放在产生日志的一端：internal/obs/log.go 的
+                // ReplaceAttr 已经输出小写 level，Python 和 Node 本来也是小写。
 
                 stage.labels {
                   values = {
