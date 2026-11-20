@@ -24,6 +24,10 @@ jobs:
             context: backend
           - name: frontend
             context: frontend
+          # 目录名和服务名不一致（fulfillment-service → fulfillment），
+          # 所以 context 得单独给，不能靠 name 拼
+          - name: fulfillment
+            context: fulfillment-service
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -74,7 +78,9 @@ jobs:
           set -euo pipefail
           # Docker tag 必须小写，GitHub 用户名 Jeffrey-Xu 是混合大小写
           PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
-          for svc in backend frontend; do
+          # payment（Python）故意不在列表里：它的镜像还是本地 local1，
+          # 等它的依赖打包也走 CI 了再加进来
+          for svc in backend frontend fulfillment; do
             yq -i "(.images[] | select(.name == \"${PREFIX}/${svc}\") | .newTag) = \"${SHA}\"" deploy/kustomization.yaml
           done
           echo "--- 结果 ---"

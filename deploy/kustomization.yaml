@@ -20,9 +20,9 @@ images:
   # 内容等价于 backend 主干 + payment 客户端接线。
   # fulfill1 = 加了 account 二进制的那一版（同样走本地交叉编译打包）。
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: c19290ff454f582fe0b5297bb95df9ad6e4bb09b
+    newTag: fulfill1
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: c19290ff454f582fe0b5297bb95df9ad6e4bb09b
+    newTag: fulfill1
   # 支付服务是 Python，镜像单独构建；本地用 Docker 直接 build 出 local1 这个 tag
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
     newTag: local1

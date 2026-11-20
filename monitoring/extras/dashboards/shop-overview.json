@@ -431,6 +431,188 @@
           "legendFormat": "{{result}}"
         }
       ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "履约：发货单创建（Node）",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(fulfillment_shipments_created_total[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "description": "duplicate 是正常的：order.paid 至少投递一次，重复消息被幂等挡住"
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "履约：物流状态推进",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (from, to) (rate(fulfillment_advances_total{result=\"ok\"}[5m]))",
+          "legendFormat": "{{from}} → {{to}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "在途发货单",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "fulfillment_orders_in_flight",
+          "legendFormat": "未签收"
+        }
+      ],
+      "description": "还没到 DELIVERED 的发货单数量。长期不下降说明推进器卡住了"
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "履约：回写订单耗时",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(fulfillment_callback_duration_seconds_bucket{result=\"ok\"}[5m])))",
+          "legendFormat": "p95 ok"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(fulfillment_callback_duration_seconds_bucket{result=~\"retry|error|fatal\"}[5m])))",
+          "legendFormat": "p95 失败"
+        }
+      ],
+      "description": "Node 回调 api 的 /api/internal/shipments"
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "账号：注册与登录",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (action, result) (rate(shop_auth_events_total[5m]))",
+          "legendFormat": "{{action}} / {{result}}"
+        }
+      ],
+      "description": "invalid 突然升高可能是撞库尝试"
     }
   ]
 }
