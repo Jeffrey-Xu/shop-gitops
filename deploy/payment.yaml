@@ -1,0 +1,126 @@
+# 支付服务：Python / FastAPI，模拟第三方网关
+# 独立 Deployment + 独立 DB 表（payments），通过 HTTP 被调用方使用，不碰 orders 表
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment
+  labels:
+    app: payment
+    app.kubernetes.io/part-of: shop
+spec:
+  replicas: 1
+  # 单副本 + 本地环境：Recreate 避免滚动更新时新旧 pod 抢同一个端口区间
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: payment
+  template:
+    metadata:
+      labels:
+        app: payment
+        app.kubernetes.io/part-of: shop
+    spec:
+      containers:
+        - name: payment
+          image: ghcr.io/jeffrey-xu/shop-gitops/payment:local1
+          env:
+            # 与 api / worker 共用同一个 PG（不同表），Secret 键名是 kebab-case
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: database-url
+            # 0 = 全部成功；演练拒付时改成 0.3 之类
+            - name: PAYMENT_FAILURE_RATE
+              value: "0"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: shop-config
+                  key: LOG_LEVEL
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment
+  labels:
+    app: payment
+spec:
+  selector:
+    app: payment
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payment
+  labels:
+    app: payment
+    # Prometheus 的 serviceMonitorSelector 只认这个标签，少一个就静默不抓
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: payment
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+# 用 /pay 前缀暴露到集群外，方便不用 port-forward 直接 curl：
+#   curl -X POST localhost/pay/charge -d '{"order_id":"x","amount_cents":100}'
+# 需要把 /pay/charge 重写成 /charge，所以用正则 + rewrite-target
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payment
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: shop.localhost
+      http:
+        paths:
+          - path: /pay(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: payment
+                port:
+                  number: 8080
+    - http:
+        paths:
+          - path: /pay(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: payment
+                port:
+                  number: 8080
