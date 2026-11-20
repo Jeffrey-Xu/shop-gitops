@@ -2,7 +2,7 @@
 
 一个刻意做小的电商后端，用来把 **缓存 + 消息队列 + 事务性 outbox + 可观测性** 这几件事在真集群里跑通。
 
-前端是静态站，后端是 Go（`api` + `worker` 两个入口同一个镜像），数据落宿主机的 PostgreSQL，Redis 做读缓存，RabbitMQ 做异步事件。交付走 **GitHub Actions 构建 + ArgoCD 同步**。
+前端是静态站，后端是 Go（`api` + `worker` 两个入口同一个镜像），数据落宿主机的 PostgreSQL，Redis 做读缓存，RabbitMQ 做异步事件。另外有一个独立的 **Python/FastAPI 支付服务**（`payment-service/`），用同一个 PG 的不同表。交付走 **GitHub Actions 构建 + ArgoCD 同步**。
 
 ```
 改代码 push
@@ -22,9 +22,11 @@
 | `backend/internal/` | `config` `obs` `httpx` `cache` `store` `broker` `outbox` `api` `worker` |
 | `backend/internal/store/migrations/` | `go:embed` 的 SQL 迁移，启动时同步执行，失败即退出 |
 | `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管 |
-| `deploy/` | Kustomize：namespace、api/worker/frontend、ingress、monitoring |
+| `payment-service/` | Python 3.12 + FastAPI，模拟第三方支付网关（幂等扣款 + 落库 + 回查） |
+| `deploy/` | Kustomize：namespace、api/worker/frontend/payment、ingress、monitoring |
 | `argocd/` | ArgoCD 引导清单（`install.yaml` 不进 Git） |
 | `monitoring/` | metrics-server / kube-prometheus-stack / loki / alloy 的 Application |
+| `monitoring/extras/` | mailpit、宿主 PG/Redis exporter、Grafana 业务大盘（由 `monitoring-extras` 这个 Application 管） |
 | `scripts/` | `git-doctor.sh` 推送链路诊断、`push-via-api.py` 兜底提交 |
 | `.github/workflows/ci.yaml` | 矩阵构建 + 回写 tag |
 
@@ -45,6 +47,20 @@
 
 > `healthz` 与 `readyz` 分开：依赖挂了应该摘流量，不该被 liveness 反复重启。
 > 注意 `readyz` 目前把 Redis 当成硬依赖，Redis 挂会导致整个 api 摘流量——见「已知限制」。
+
+支付服务（独立进程，集群内 `svc/payment:8080`，集群外走 `/pay` 前缀，ingress 用正则重写）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/charge` | `{order_id, amount_cents, currency}` → 扣款；同一 `order_id` 重放返回同一条记录且 `replayed=true` |
+| GET | `/payments/{order_id}` | 回查扣款结果，不存在返回 404 |
+| GET | `/healthz` `/readyz` `/metrics` | 存活 / 就绪（查 PG）/ 指标 |
+
+```bash
+curl -X POST http://localhost/pay/charge -H 'Content-Type: application/json' \
+  -d '{"order_id":"ord_001","amount_cents":9900}' -i | tail -1
+# 再发一次 → 同一个 payment_id，replayed: true（幂等，不会重复扣款）
+```
 
 ## 一次下单的完整路径
 
@@ -197,18 +213,30 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 ## 可观测性
 
-集群内 `monitoring` 命名空间，4 个 Application 全由 ArgoCD 管：
+集群内 `monitoring` 命名空间，5 个 Application 全由 ArgoCD 管：
 
-| 组件 | Chart | 说明 |
+| 组件 | Chart / 来源 | 说明 |
 |---|---|---|
 | metrics-server | 3.14.0 | `kubectl top`，带 `--kubelet-insecure-tls` |
-| kube-prometheus-stack | 93.4.0 | Prometheus + Grafana + Alertmanager + node-exporter |
-| loki | 7.6.0 | SingleBinary 模式 |
+| kube-prometheus-stack | 93.4.0 | Prometheus + Grafana + Alertmanager + node-exporter + KSM + operator |
+| loki | 7.6.0 | SingleBinary + filesystem，`retention_period: 168h` |
 | alloy | 1.16.0 | DaemonSet，走 API 读容器日志，`stage.cri` + `stage.json` |
+| monitoring-extras | 本仓库 `monitoring/extras` | mailpit、postgres-exporter、redis-exporter、业务大盘 |
 
-应用侧指标：`shop_http_requests_total`、`shop_cache_lookups_total`、`shop_orders_processed_total`、`shop_queue_depth`、`shop_outbox_pending`。
+**Metric 链路**：应用 `/metrics`（`prometheus/client_golang` + `promauto`）→ `ServiceMonitor`（15s）→ Prometheus（TSDB，7d / 4GB / 8Gi PVC）→ Grafana + 3 条 `PrometheusRule` 告警。
 
-告警（`PrometheusRule`）：5xx 比例过高（2m）、队列积压 > 10（3m）、outbox 卡住 > 20（3m）。
+- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_queue_depth`、`shop_outbox_pending`；支付服务另有 `payment_charges_total`、`payment_charge_duration_seconds`。
+- 宿主中间件：PG 与 Redis 用 exporter Pod 去 `host.docker.internal` 抓（`postgres-exporter`、`redis-exporter`），RabbitMQ 自带 `/metrics` 用 `additionalScrapeConfigs` 静态抓 `host.docker.internal:15692`。共 24 个 target 全 up。
+- 大盘：`shop 业务总览`（`grafana.localhost` → Dashboards），含下单速率、5xx 比例、P50/95/99、缓存命中率、队列积压、worker 处理结果、outbox 投递结果。
+
+**Log 链路**：slog JSON → stdout → Alloy（`discovery.kubernetes` + `loki.source.kubernetes`，不挂 hostPath）→ `stage.cri` 拆行 → `stage.json` 取 `level`/`msg` → `level` 做成 label，`request_id`/`order_id`/`service` 放 structured metadata → `loki-gateway` → Loki（10Gi PVC）。
+
+- `level` 基数只有 5 个可以当索引；`request_id` 每个请求都不同，做 label 会把索引撑爆，所以放 structured metadata。
+- Alloy 里是 River 语法，**注释只能 `//`**。写成 `#` 会让 reload 静默失败并继续跑旧配置（ArgoCD 仍显示 Healthy），排查见「已知限制」。
+
+**告警投递**：Alertmanager → SMTP → mailpit（`mailpit.localhost`）→ `oncall@shop.local`。默认 receiver 是 `null`（只 fire 不通知），现在改成 email；`route` 里那条 Watchdog 子路由仍指向 `null`，所以 receivers 里必须保留一个名为 `"null"` 的空接收器，否则 operator 报 `undefined receiver "null"` 拒绝渲染。
+
+**Tracing：没有。** 全仓库没有 OTel SDK / Collector / Tempo。跨 `api → RabbitMQ → worker` 目前只能靠 `request_id` + `order_id` 在 Loki 里手工串；没有父子 span，也就无法回答“这 800ms 里 PG 占了多少”。
 
 > ServiceMonitor **必须**带 `release: kube-prometheus-stack` 标签，否则静默不抓。
 
@@ -242,6 +270,10 @@ curl -X POST http://localhost/api/orders -H 'Content-Type: application/json' \
 - `orders(status)` 无索引，`/api/stats` 每次全表扫
 - 单副本、无 HPA/PDB、无 NetworkPolicy
 - 没有用户体系，`Idempotency-Key` 由前端生成
+- **支付服务还没接进下单链路**：worker 仍是内置的模拟支付逻辑，`payment-service` 目前只能通过 `/pay` 手工调用
+- 支付镜像是本地 `docker build` 的 `local1` tag，没走 CI；集群重置后要重新 build 并导入节点（`docker save | docker exec -i desktop-worker ctr -n k8s.io images import -`）
+- Alloy 的 River 配置写 `#` 注释会**静默**失效（reload 报错但继续跑旧配置，ArgoCD 依旧 Synced/Healthy）；排查方式是看 alloy 日志里的 `failed to reload config`
+- 没有 tracing：跨 api→MQ→worker 只能靠 `request_id`/`order_id` 手工串日志
 
 ## 推送排障：`git push` 报 502 / 超时怎么办
 
