@@ -89,18 +89,25 @@ shop.events (topic) ──order.created──▶ shop.order.created
    ▼
 worker：basic.consume（push，非轮询，prefetch=5）
    ├─ 闸门 1：status != CREATED → ack 跳过（重复投递短路）
+   ├─ POST http://payment:8080/charge   ← 真实扣款，3s 超时，按 order_id 幂等
    ├─ 闸门 2：UPDATE ... WHERE status='CREATED'（乐观锁）
    │           + order_events 唯一约束兜底
-   └─ ack → 订单变 PAID
+   └─ ack → 订单变 PAID（order_events.note 里带 payment_id）
 ```
 
-失败路径（worker 内）：
+失败路径（worker 内），**关键是把"拒付"和"临时故障"分开**：
 
 ```
-支付失败
- ├─ attempts < 3 ──▶ publish 到 shop.dlx / .retry（TTL 10s 自动回主队列）──▶ ack
- └─ attempts >= 3 ─▶ publish 到 .dlq ──▶ CancelOrder（状态 CANCELLED + 库存回补 + 审计）──▶ ack
+POST /charge 的三种结局
+ ├─ succeeded              ──▶ 闸门 2 → PAID
+ ├─ failed / 4xx（拒付）   ──▶ CancelOrder（CANCELLED + 库存回补）──▶ ack   [不重试]
+ │                              重试一百次也是同一张卡被拒，纯浪费
+ └─ 超时 / 5xx / 连不上
+      ├─ attempts < 3 ──▶ publish 到 shop.dlx / .retry（TTL 10s 回主队列）──▶ ack
+      └─ attempts >= 3 ─▶ publish 到 .dlq ──▶ CancelOrder ──▶ ack
 ```
+
+未配置 `PAYMENT_URL` 时 worker 退回内置模拟支付，本地不想起 Python 服务也能跑通全链路。
 
 设计取舍：**at-least-once + 消费端幂等**，而不是「commit 完再 publish」。后者会丢消息且无法发现。代价是可能重复投递，由两道闸门消化。
 
@@ -118,19 +125,22 @@ worker：basic.consume（push，非轮询，prefetch=5）
 
 ## 部署形态
 
-集群里一个 `shop` 命名空间，Kustomize 渲染出 13 个对象：
+集群里一个 `shop` 命名空间，Kustomize 渲染出 17 个对象：
 
 ```
 Namespace shop
 ConfigMap shop-config        APP_VERSION / LOG_LEVEL / CACHE_TTL / DEV_MODE
                              REDIS_ADDR / MQ_PREFETCH / MQ_MAX_ATTEMPTS
+                             PAYMENT_URL / PAYMENT_TIMEOUT
 Secret    shop-secret        database-url / rabbitmq-url
 Deployment api     1 副本    /app/api      req 50m/64Mi   limit 500m/256Mi
 Deployment worker  1 副本    /app/worker   req 30m/48Mi   limit 300m/192Mi
 Deployment frontend 1 副本   nginx:1.27    req 20m/32Mi   limit 200m/128Mi
-Service   api / frontend / worker
+Deployment payment 1 副本    uvicorn       req 50m/96Mi   limit 300m/256Mi
+Service   api / frontend / worker / payment
 Ingress   shop               shop.localhost + 无 host 兜底
-ServiceMonitor api / worker
+          payment            /pay(/|$)(.*) → rewrite /$2
+ServiceMonitor api / worker / payment
 PrometheusRule shop         3 条告警
 ```
 
@@ -225,9 +235,9 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 **Metric 链路**：应用 `/metrics`（`prometheus/client_golang` + `promauto`）→ `ServiceMonitor`（15s）→ Prometheus（TSDB，7d / 4GB / 8Gi PVC）→ Grafana + 3 条 `PrometheusRule` 告警。
 
-- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_queue_depth`、`shop_outbox_pending`；支付服务另有 `payment_charges_total`、`payment_charge_duration_seconds`。
+- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_payment_calls_total`（`result=succeeded|declined|error|disabled`）、`shop_queue_depth`、`shop_outbox_pending`；支付服务另有 `payment_charges_total`、`payment_charge_duration_seconds`。
 - 宿主中间件：PG 与 Redis 用 exporter Pod 去 `host.docker.internal` 抓（`postgres-exporter`、`redis-exporter`），RabbitMQ 自带 `/metrics` 用 `additionalScrapeConfigs` 静态抓 `host.docker.internal:15692`。共 24 个 target 全 up。
-- 大盘：`shop 业务总览`（`grafana.localhost` → Dashboards），含下单速率、5xx 比例、P50/95/99、缓存命中率、队列积压、worker 处理结果、outbox 投递结果。
+- 大盘：`shop 业务总览`（`grafana.localhost` → Dashboards），10 块面板，含下单速率、5xx 比例、P50/95/99、缓存命中率、队列积压、worker 处理结果、outbox 投递结果，最后一行是支付的**两侧视角**（worker 调了多少次 / 网关自己记了多少笔）。
 
 **Log 链路**：slog JSON → stdout → Alloy（`discovery.kubernetes` + `loki.source.kubernetes`，不挂 hostPath）→ `stage.cri` 拆行 → `stage.json` 取 `level`/`msg` → `level` 做成 label，`request_id`/`order_id`/`service` 放 structured metadata → `loki-gateway` → Loki（10Gi PVC）。
 
@@ -239,6 +249,31 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 **Tracing：没有。** 全仓库没有 OTel SDK / Collector / Tempo。跨 `api → RabbitMQ → worker` 目前只能靠 `request_id` + `order_id` 在 Loki 里手工串；没有父子 span，也就无法回答“这 800ms 里 PG 占了多少”。
 
 > ServiceMonitor **必须**带 `release: kube-prometheus-stack` 标签，否则静默不抓。
+
+## 支付服务（payment-service）
+
+一个独立的 Python/FastAPI 小服务，模拟第三方支付网关。它**不是** shop 的一部分进程，而是 worker 通过 HTTP 调的外部依赖。
+
+```
+POST /charge                 {order_id, amount_cents} → {status, payment_id, replayed}
+GET  /payments/{order_id}    对账/回查
+GET  /healthz /readyz /metrics
+```
+
+| 契约 | 实现方式 |
+|---|---|
+| **幂等** | `order_id` 是 `payments` 主键。先 `INSERT ... ON CONFLICT DO NOTHING` 再回查，而不是「先查后插」——后者并发下会双扣 |
+| **持久化** | 扣款结果落 PG，进程重启不丢 |
+| **可回查** | `GET /payments/{order_id}`，worker 可以拿它对账 |
+| **拒付是业务结果** | 返回 200 + `status: "failed"` + `failure_reason`，不是 500 |
+
+调用约定（`worker` 侧 `internal/payment`）：
+
+- `PAYMENT_URL` 为空 → 不调网关，走内置模拟支付（本地不想起 Python 时就这样）
+- 4xx 或 `status=failed` → `*DeclinedError`：**一次就取消订单**，不重试
+- 超时（默认 3s）/ 连不上 / 5xx → 普通 error：走 `10s × 3` 退避重试，耗尽后 DLQ + 补偿
+
+`PAYMENT_FAILURE_RATE`（0~1）按 `sha256(order_id)` 决定拒付，同一个订单每次判定一致，方便演示“重放不会变成成功”。
 
 ## 故障演练
 
@@ -256,6 +291,14 @@ kubectl -n shop scale deploy/worker --replicas=1
 # 支付失败 → 3 次重试 → DLQ + 库存回补
 redis-cli SET shop:demo:fail 1
 
+# 真·拒付（payment 侧返回 failed）→ 一次就取消，不走重试
+kubectl -n shop set env deploy/payment PAYMENT_FAILURE_RATE=1   # 测完 set env ... PAYMENT_FAILURE_RATE=0
+# 注意 ArgoCD 开了 selfHeal，手改会被自动改回 git 里的值，要先把 app 的
+# syncPolicy.automated 摘掉再改，测完恢复
+
+# 网关整体不可用 → 连接拒绝 → 3 次重试后 CANCELLED + DLQ
+kubectl -n shop scale deploy/payment --replicas=0
+
 # 幂等：同一 key 第一次 201，第二次 200，同一个订单号
 curl -X POST http://localhost/api/orders -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo-1' -d '{"productId":1,"quantity":1}'
@@ -270,10 +313,41 @@ curl -X POST http://localhost/api/orders -H 'Content-Type: application/json' \
 - `orders(status)` 无索引，`/api/stats` 每次全表扫
 - 单副本、无 HPA/PDB、无 NetworkPolicy
 - 没有用户体系，`Idempotency-Key` 由前端生成
-- **支付服务还没接进下单链路**：worker 仍是内置的模拟支付逻辑，`payment-service` 目前只能通过 `/pay` 手工调用
 - 支付镜像是本地 `docker build` 的 `local1` tag，没走 CI；集群重置后要重新 build 并导入节点（`docker save | docker exec -i desktop-worker ctr -n k8s.io images import -`）
+- backend 的 `paywiring1` 同样是本地补丁镜像：Docker Hub 不可达时拉不到 `golang:1.24-alpine`，于是宿主机 `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build` 之后，用现成镜像的运行层重新打包（见下文「Docker Hub 挂了怎么出镜像」）
+- worker 调支付是**同步 HTTP**，3s 超时；支付服务慢会直接压到消费者的消费速率（prefetch=5 时最多 5 个并发卡在等）
 - Alloy 的 River 配置写 `#` 注释会**静默**失效（reload 报错但继续跑旧配置，ArgoCD 依旧 Synced/Healthy）；排查方式是看 alloy 日志里的 `failed to reload config`
 - 没有 tracing：跨 api→MQ→worker 只能靠 `request_id`/`order_id` 手工串日志
+
+## Docker Hub 不可达时怎么出镜像
+
+现象：`docker build` 报 `failed to fetch oauth token: Post "https://auth.docker.io/token": Bad Gateway`，
+`docker pull golang:1.24-alpine` 同样失败。这是 Docker Hub 认证端点的问题，重试几次不一定好。
+
+绕法：**不重建基础层，只换运行层里的二进制**。
+
+```bash
+cd backend
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/paybuild/api    ./cmd/api
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/paybuild/worker ./cmd/worker
+```
+
+`/tmp/paybuild/Dockerfile` —— `FROM` 用现成镜像的完整引用，**必须带 `@sha256:`**：
+只写短 ID 时 BuildKit 会去 registry 做认证（然后 502）。
+
+```dockerfile
+FROM ghcr.io/jeffrey-xu/shop-gitops/backend:0364df2...@sha256:6aa0ec9a...
+COPY --chown=10001:10001 api /app/api
+COPY --chown=10001:10001 worker /app/worker
+USER app
+CMD ["/app/api"]
+```
+
+然后 `docker build` → 导入两个节点 → 改 `deploy/kustomization.yaml` 的 `newTag`。
+
+架构要对：本机是 arm64，交叉编译目标写 `linux/arm64`
+（`kubectl get nodes -o custom-columns=ARCH:.status.nodeInfo.architecture` 确认）。
+`--chown` 保留 uid 10001，别让 `runAsNonRoot` + `readOnlyRootFilesystem` 的组合翻车。
 
 ## 推送排障：`git push` 报 502 / 超时怎么办
 
