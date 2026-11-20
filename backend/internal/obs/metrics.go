@@ -43,6 +43,13 @@ var (
 		Help: "outbox relay 投递结果",
 	}, []string{"result"})
 
+	// result: succeeded / declined / error / disabled
+	// declined 与 error 的区别很关键：前者是终态（卡被拒），后者值得重试
+	PaymentCalls = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shop_payment_calls_total",
+		Help: "worker 调用支付网关的结果",
+	}, []string{"result"})
+
 	QueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "shop_queue_depth",
 		Help: "主队列积压消息数（每 15s 采样一次）",

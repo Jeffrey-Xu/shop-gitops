@@ -1,11 +1,13 @@
-// Package worker 消费订单事件：模拟支付 → 改状态 → 失败则重试 → 超限则补偿。
+// Package worker 消费订单事件：扣款 → 改状态 → 失败则重试 → 超限则补偿。
 package worker
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -14,6 +16,7 @@ import (
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/cache"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/config"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/obs"
+	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/payment"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/store"
 )
 
@@ -23,6 +26,8 @@ type Worker struct {
 	Cache  *cache.Cache
 	Broker *broker.Broker
 	Cfg    config.Config
+	// Pay 为 nil 或没配 PAYMENT_URL 时走内置模拟支付
+	Pay *payment.Client
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -65,10 +70,28 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 		return w.retry(ctx, msg, ev, attempts, log, errors.New("演示注入：支付渠道超时"))
 	}
 
+	// 真正的支付动作。三种结局必须分开，这是这段代码的核心：
+	//   成功            → 继续把订单推进到 PAID
+	//   拒付 Declined   → 业务终态，重试没意义，直接取消 + 回补库存
+	//   其他 error      → 临时故障（超时/5xx），走退避重试
+	note, err := w.charge(ctx, ev, attempts, log)
+	var declined *payment.DeclinedError
+	switch {
+	case errors.As(err, &declined):
+		obs.PaymentCalls.WithLabelValues("declined").Inc()
+		w.cancel(ctx, ev, log, "order_cancelled_on_decline",
+			"worker: payment declined: "+declined.Reason)
+		_ = msg.Ack()
+		return nil
+	case err != nil:
+		obs.PaymentCalls.WithLabelValues("error").Inc()
+		return w.retry(ctx, msg, ev, attempts, log, err)
+	}
+
 	start := time.Now()
 	// 幂等闸门 2：UPDATE ... WHERE status='CREATED' 是乐观锁，
 	// 加上 order_events 的 UNIQUE(order_id, to_status)，双保险。
-	changed, err := w.Store.MarkOrderPaid(ctx, ev.OrderID, "worker: payment captured (simulated)")
+	changed, err := w.Store.MarkOrderPaid(ctx, ev.OrderID, note)
 	if err != nil {
 		return w.retry(ctx, msg, ev, attempts, log, err)
 	}
@@ -88,6 +111,26 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	return nil
 }
 
+// charge 决定走真实网关还是内置模拟，返回要写进 order_events.note 的文案。
+func (w *Worker) charge(ctx context.Context, ev store.OrderCreatedEvent, attempts int, log *slog.Logger) (string, error) {
+	if w.Pay == nil || !w.Pay.Enabled() {
+		obs.PaymentCalls.WithLabelValues("disabled").Inc()
+		return "worker: payment captured (simulated)", nil
+	}
+
+	// worker 没有入站 HTTP 请求，自己造一个 request id 传给网关；
+	// 这样在 Loki 里按同一个值能同时查到 worker 和 payment 两侧的日志。
+	rid := fmt.Sprintf("order-%d-try%d", ev.OrderID, attempts+1)
+	res, err := w.Pay.Charge(payment.WithRequestID(ctx, rid), strconv.FormatInt(ev.OrderID, 10), ev.TotalCents)
+	if err != nil {
+		return "", err
+	}
+
+	obs.PaymentCalls.WithLabelValues("succeeded").Inc()
+	log.Info("payment_captured", "payment_id", res.PaymentID, "replayed", res.Replayed)
+	return fmt.Sprintf("worker: payment captured (%s)", res.PaymentID), nil
+}
+
 // retry 决定「再试一次」还是「认输并补偿」。
 // 注意先 publish 再 ack：如果 publish 失败就把原消息退回队列，
 // 不能既没发出去又把原消息确认掉。
@@ -104,20 +147,8 @@ func (w *Worker) retry(ctx context.Context, msg broker.Message, ev store.OrderCr
 		}
 
 		// 补偿：订单作废 + 库存回补（库存是下单时预扣的）
-		changed, productIDs, err := w.Store.CancelOrder(ctx, ev.OrderID, "worker: payment failed after retries: "+cause.Error())
-		if err != nil {
-			log.Error("compensation_failed", "err", err)
-		} else if changed {
-			keys := []string{cache.KeyProductList}
-			for _, id := range productIDs {
-				keys = append(keys, cache.KeyProduct(id))
-			}
-			if err := w.Cache.Del(ctx, keys...); err != nil {
-				log.Warn("cache_invalidate_failed", "keys", keys, "err", err)
-			}
-			obs.OrdersProcessed.WithLabelValues("cancelled").Inc()
-			log.Error("order_cancelled_after_retries", "err", cause, "max_attempts", w.Cfg.MaxAttempts)
-		}
+		w.cancel(ctx, ev, log, "order_cancelled_after_retries",
+			"worker: payment failed after retries: "+cause.Error())
 
 		return msg.Ack()
 	}
@@ -134,6 +165,30 @@ func (w *Worker) retry(ctx context.Context, msg broker.Message, ev store.OrderCr
 	obs.OrdersProcessed.WithLabelValues("retry").Inc()
 	log.Warn("order_retry_scheduled", "err", cause, "delay_ms", broker.RetryDelayMS)
 	return msg.Ack()
+}
+
+// cancel 是共用的补偿动作：订单置 CANCELLED + 回补库存 + 删缓存。
+// 拒付和重试耗尽两条路径都走它，避免逻辑各写一份然后漂移。
+func (w *Worker) cancel(ctx context.Context, ev store.OrderCreatedEvent, log *slog.Logger, logKey, note string) {
+	changed, productIDs, err := w.Store.CancelOrder(ctx, ev.OrderID, note)
+	if err != nil {
+		log.Error("compensation_failed", "err", err)
+		return
+	}
+	if !changed {
+		log.Info("order_already_finalized")
+		return
+	}
+
+	keys := []string{cache.KeyProductList}
+	for _, id := range productIDs {
+		keys = append(keys, cache.KeyProduct(id))
+	}
+	if err := w.Cache.Del(ctx, keys...); err != nil {
+		log.Warn("cache_invalidate_failed", "keys", keys, "err", err)
+	}
+	obs.OrdersProcessed.WithLabelValues("cancelled").Inc()
+	log.Error(logKey, "reason", note)
 }
 
 func headerInt(h amqp.Table, key string) int {

@@ -19,7 +19,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shop
 data:
-  APP_VERSION: "v2"
+  APP_VERSION: "v3-payment"
   LOG_LEVEL: "info"
   CACHE_TTL: "30s"
   # 打开后才注册 /api/dev/fault（演示错误率和日志链路用）
@@ -27,6 +27,10 @@ data:
   REDIS_ADDR: "host.docker.internal:6379"
   MQ_PREFETCH: "5"
   MQ_MAX_ATTEMPTS: "3"
+  # 支付网关地址（worker 用，api 读到也不用）。指向同命名空间的 payment Service。
+  # 留空则 worker 退回内置模拟支付 —— 本地单机跑不用起 Python 服务时就这样。
+  PAYMENT_URL: "http://payment:8080"
+  PAYMENT_TIMEOUT: "3s"
 ---
 apiVersion: apps/v1
 kind: Deployment

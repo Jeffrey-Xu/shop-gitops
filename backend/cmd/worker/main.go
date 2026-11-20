@@ -14,6 +14,7 @@ import (
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/cache"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/config"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/obs"
+	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/payment"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/store"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/worker"
 )
@@ -84,7 +85,15 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	w := &worker.Worker{Log: log, Store: st, Cache: c, Broker: brk, Cfg: cfg}
+	// 支付网关：PAYMENT_URL 没配就是模拟支付（本地单机跑不用起 payment 服务）
+	payClient := payment.New(cfg.PaymentURL, cfg.PaymentTimeout, log)
+	if payClient.Enabled() {
+		log.Info("payment_gateway_enabled", "url", cfg.PaymentURL, "timeout", cfg.PaymentTimeout.String())
+	} else {
+		log.Info("payment_gateway_disabled_using_simulator")
+	}
+
+	w := &worker.Worker{Log: log, Store: st, Cache: c, Broker: brk, Cfg: cfg, Pay: payClient}
 	log.Info("worker_starting", "queue", broker.QueueOrderCreated, "prefetch", cfg.Prefetch, "max_attempts", cfg.MaxAttempts)
 	if err := w.Run(ctx); err != nil {
 		log.Error("worker_stopped_with_error", "err", err)

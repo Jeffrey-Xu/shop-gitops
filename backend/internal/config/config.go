@@ -23,12 +23,21 @@ type Config struct {
 	DevMode     bool
 	Prefetch    int
 	MaxAttempts int
+	// PaymentURL 为空表示不接真实支付网关，worker 退回内置的模拟支付。
+	// 集群里指向 http://payment:8080（同命名空间的 Service）。
+	PaymentURL     string
+	PaymentTimeout time.Duration
 }
 
 func Load(service string) (Config, error) {
 	ttl, err := time.ParseDuration(env("CACHE_TTL", "30s"))
 	if err != nil {
 		return Config{}, fmt.Errorf("CACHE_TTL 无法解析: %w", err)
+	}
+
+	payTimeout, err := time.ParseDuration(env("PAYMENT_TIMEOUT", "3s"))
+	if err != nil {
+		return Config{}, fmt.Errorf("PAYMENT_TIMEOUT 无法解析: %w", err)
 	}
 
 	c := Config{
@@ -45,6 +54,10 @@ func Load(service string) (Config, error) {
 		DevMode:     env("DEV_MODE", "false") == "true",
 		Prefetch:    atoi(env("MQ_PREFETCH", "5"), 5),
 		MaxAttempts: atoi(env("MQ_MAX_ATTEMPTS", "3"), 3),
+		// 故意不给默认值：没设就是「不接网关」，走模拟支付。
+		// 给了默认值会让本地跑的时候意外去连一个不存在的地址。
+		PaymentURL:     os.Getenv("PAYMENT_URL"),
+		PaymentTimeout: payTimeout,
 	}
 
 	if c.DatabaseURL == "" {
