@@ -86,6 +86,9 @@ spec:
               # 演练时别刷屏：同一个告警 4 小时内只重发一次
               repeat_interval: 4h
             receivers:
+              # 必须有这个空接收器：chart 默认的 route 里有一条 Watchdog 子路由指向 "null"，
+              # 我们只提供 mailpit 的话，operator 会报 undefined receiver "null" 并拒绝渲染配置
+              - name: "null"
               - name: mailpit
                 email_configs:
                   - to: oncall@shop.local
