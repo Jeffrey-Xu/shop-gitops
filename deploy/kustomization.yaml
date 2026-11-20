@@ -14,9 +14,9 @@ resources:
 # api 和 worker 用的是同一个 backend 镜像，所以只需要两条
 images:
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: 747c9ee168c8fde659dce6fb29444976b759b52c
+    newTag: 0364df2aba609ac99e275deeff6db16fd690ba79
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: 747c9ee168c8fde659dce6fb29444976b759b52c
+    newTag: 0364df2aba609ac99e275deeff6db16fd690ba79
   # 支付服务是 Python，镜像单独构建；本地用 Docker 直接 build 出 local1 这个 tag
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
     newTag: local1

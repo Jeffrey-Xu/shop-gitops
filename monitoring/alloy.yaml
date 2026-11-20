@@ -1,6 +1,9 @@
 # 日志采集：DaemonSet 形态，每个节点一个
 # 用 loki.source.kubernetes 走 API 读 pod 日志（chart 的 ClusterRole 已含 pods/log），
 # 不需要挂 hostPath /var/log/containers —— 少一层对宿主机路径的依赖
+#
+# 注意：下面 content 里是 Alloy 自己的配置语言（River），注释只能用 // 或 /* */，
+# 用 # 会让 Alloy 报 "illegal character U+0023" 并静默保留旧配置（ArgoCD 仍显示 Healthy）。
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -67,8 +70,8 @@ spec:
                   source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
                   target_label  = "app"
                 }
-                # 我们自己的工作负载用的是简写 label app，不是 k8s 推荐的
-                # app.kubernetes.io/name，所以两条都要有，后者覆盖前者
+                // 我们自己的工作负载用的是简写 label app，不是 k8s 推荐的
+                // app.kubernetes.io/name，所以两条都要有，后者覆盖前者
                 rule {
                   source_labels = ["__meta_kubernetes_pod_label_app"]
                   target_label  = "app"
@@ -88,9 +91,9 @@ spec:
               loki.process "pipeline" {
                 stage.cri {}
 
-                # 后端输出的是 slog JSON，这里解析成结构化字段：
-                # level 提成 label（基数只有 5 个，可以当索引）
-                # request_id / order_id 放 structured metadata（不建索引但可按等值过滤）
+                // 后端输出的是 slog JSON，这里解析成结构化字段：
+                // level 提成 label（基数只有 5 个，可以当索引）
+                // request_id / order_id 放 structured metadata（不建索引但可按等值过滤）
                 stage.json {
                   expressions = {
                     level = "level",
