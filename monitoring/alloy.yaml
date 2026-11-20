@@ -101,6 +101,15 @@ spec:
                   }
                 }
 
+                // 三种语言的日志库对 level 大小写不一致：
+                // Go 的 slog 输出 "INFO"/"WARN"，pino 输出 "info"/"warn"。
+                // 不统一的话 Grafana 里 {level="error"} 只能匹配到 Python 和 Node 的错误，
+                // Go 的 ERROR 会漏掉 —— 这种坑在真出事的时候才知道，代价太大。
+                stage.template {
+                  source   = "level"
+                  template = "{{ if .Value }}{{ ToLower .Value }}{{ end }}"
+                }
+
                 stage.labels {
                   values = {
                     level = "",
