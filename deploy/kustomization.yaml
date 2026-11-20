@@ -7,20 +7,27 @@ resources:
   - worker.yaml
   - frontend.yaml
   - payment.yaml
+  # 账号服务（Go）与履约服务（Node）是这一轮新增的两个角色
+  - account.yaml
+  - fulfillment.yaml
   - ingress.yaml
   # 告警规则；ServiceMonitor 跟着各自的服务放在 api.yaml / worker.yaml 里
   - monitoring.yaml
 # CI 会改写这里，把 tag 换成当前 commit sha
-# api 和 worker 用的是同一个 backend 镜像，所以只需要两条
+# api / worker / account 用的是同一个 backend 镜像，所以只需要一条
 images:
   # paywiring1 = 本地交叉编译的补丁镜像（Docker Hub 挂了，拉不到 golang 基础镜像），
   # 内容等价于 backend 主干 + payment 客户端接线。
+  # fulfill1 = 加了 account 二进制的那一版（同样走本地交叉编译打包）。
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: paywiring1
+    newTag: fulfill1
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: 0364df2aba609ac99e275deeff6db16fd690ba79
+    newTag: fulfill1
   # 支付服务是 Python，镜像单独构建；本地用 Docker 直接 build 出 local1 这个 tag
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
+    newTag: local1
+  # 履约服务是 Node，镜像单独构建
+  - name: ghcr.io/jeffrey-xu/shop-gitops/fulfillment
     newTag: local1
 labels:
   - pairs:

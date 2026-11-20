@@ -11,6 +11,11 @@ stringData:
   database-url: "postgres://shop:shop@host.docker.internal:5432/shop?sslmode=disable"
   # vhost 是 /shop，必须编码成 %2F，否则会被当成路径
   rabbitmq-url: "amqp://shop:shoppass@host.docker.internal:5672/%2Fshop"
+  # account 签发、api 验签，两边必须是同一个值。改它 = 所有人重新登录。
+  jwt-secret: "949b32bab2bd7531ec3a8f25eb09d92504bc067cdd24b90af1278c81d19df3e0"
+  # 服务间共享密钥：履约服务回写发货状态时带在 X-Internal-Token 里。
+  # 和 jwt-secret 分开是刻意的 —— 机器身份和用户身份泄露一个不该连带另一个。
+  internal-token: "e8756f77bb3cafa05aee40b7acc3ae64eb90cf49025c70d6"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -31,6 +36,9 @@ data:
   # 留空则 worker 退回内置模拟支付 —— 本地单机跑不用起 Python 服务时就这样。
   PAYMENT_URL: "http://payment:8080"
   PAYMENT_TIMEOUT: "3s"
+  # JWT 的签发方与有效期。account 和 api 必须用同一个 issuer，否则验签不过。
+  JWT_ISSUER: "shop"
+  JWT_TTL: "24h"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -81,6 +89,18 @@ spec:
                 secretKeyRef:
                   name: shop-secret
                   key: rabbitmq-url
+            # 验签用：和 account 签发时用的是同一个密钥
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: jwt-secret
+            # /api/internal/shipments 的口令，没配这个值时该端点直接 404
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: internal-token
           readinessProbe:
             httpGet:
               path: /readyz

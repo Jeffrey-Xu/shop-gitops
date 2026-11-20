@@ -27,6 +27,15 @@ type Config struct {
 	// 集群里指向 http://payment:8080（同命名空间的 Service）。
 	PaymentURL     string
 	PaymentTimeout time.Duration
+
+	// JWTSecret 由 account 签发、api 验签，两边必须是同一个值。
+	// 留空时 account 会拒绝启动（签名密钥不能有默认值），api 则降级为「不鉴权」。
+	JWTSecret string
+	JWTIssuer string
+	JWTTTL    time.Duration
+	// InternalToken 用于服务间调用的共享密钥（履约服务 → api 回写发货状态）。
+	// 和 JWT 分开：机器身份和用户身份是两件事，泄露一个不该连带另一个。
+	InternalToken string
 }
 
 func Load(service string) (Config, error) {
@@ -38,6 +47,11 @@ func Load(service string) (Config, error) {
 	payTimeout, err := time.ParseDuration(env("PAYMENT_TIMEOUT", "3s"))
 	if err != nil {
 		return Config{}, fmt.Errorf("PAYMENT_TIMEOUT 无法解析: %w", err)
+	}
+
+	jwtTTL, err := time.ParseDuration(env("JWT_TTL", "24h"))
+	if err != nil {
+		return Config{}, fmt.Errorf("JWT_TTL 无法解析: %w", err)
 	}
 
 	c := Config{
@@ -58,6 +72,11 @@ func Load(service string) (Config, error) {
 		// 给了默认值会让本地跑的时候意外去连一个不存在的地址。
 		PaymentURL:     os.Getenv("PAYMENT_URL"),
 		PaymentTimeout: payTimeout,
+
+		JWTSecret:     os.Getenv("JWT_SECRET"),
+		JWTIssuer:     env("JWT_ISSUER", "shop"),
+		JWTTTL:        jwtTTL,
+		InternalToken: os.Getenv("INTERNAL_TOKEN"),
 	}
 
 	if c.DatabaseURL == "" {

@@ -7,8 +7,20 @@
 </head>
 <body>
   <header>
-    <h1>Shop</h1>
-    <p class="meta">前端静态站 · Go API · Redis 缓存 · RabbitMQ 异步 · PostgreSQL 真相源</p>
+    <div class="head-row">
+      <div>
+        <h1>Shop</h1>
+        <p class="meta">
+          前端静态站 · Go API · Redis 缓存 · RabbitMQ 异步 · PostgreSQL 真相源
+          · Node 履约 · Python 支付 · Go 账号
+        </p>
+      </div>
+      <div class="account">
+        <span id="who" class="who" hidden></span>
+        <button id="auth-open" class="ghost" type="button">登录 / 注册</button>
+        <button id="logout" class="ghost" type="button" hidden>退出</button>
+      </div>
+    </div>
   </header>
 
   <main>
@@ -25,6 +37,31 @@
     <span id="queue">queue: —</span>
     <span id="build">build: __BUILD__</span>
   </footer>
+
+  <!-- 登录/注册用原生 dialog：不需要引入任何 UI 库，
+       而且 dialog 自带焦点陷阱和 Esc 关闭 -->
+  <dialog id="auth-dialog">
+    <form id="auth-form">
+      <h2 id="auth-title">登录</h2>
+      <label>
+        邮箱
+        <input name="email" type="email" required autocomplete="email" placeholder="you@example.com" />
+      </label>
+      <label>
+        密码
+        <input name="password" type="password" required minlength="8" autocomplete="current-password" placeholder="至少 8 位" />
+      </label>
+      <label id="name-row" hidden>
+        昵称（可选）
+        <input name="displayName" type="text" autocomplete="nickname" placeholder="不填就用邮箱前缀" />
+      </label>
+      <p id="auth-error" class="auth-error" hidden></p>
+      <div class="auth-actions">
+        <button type="button" id="auth-switch" class="ghost">没有账号？去注册</button>
+        <button type="submit" id="auth-submit">登录</button>
+      </div>
+    </form>
+  </dialog>
 
   <script type="module" src="/src/main.js"></script>
 </body>

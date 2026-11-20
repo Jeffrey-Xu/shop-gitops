@@ -27,9 +27,12 @@ type OrderEvent struct {
 }
 
 type Order struct {
-	ID         int64        `json:"id"`
-	Status     string       `json:"status"`
-	TotalCents int64        `json:"totalCents"`
+	ID         int64  `json:"id"`
+	UserID     int64  `json:"userId,omitempty"`
+	Status     string `json:"status"`
+	TotalCents int64  `json:"totalCents"`
+	// TrackingNo 由履约服务回写，未发货时为空
+	TrackingNo string       `json:"trackingNo,omitempty"`
 	CreatedAt  time.Time    `json:"createdAt"`
 	UpdatedAt  time.Time    `json:"updatedAt"`
 	Items      []OrderItem  `json:"items"`
@@ -46,10 +49,36 @@ type OrderCreatedEvent struct {
 	TotalCents int64 `json:"totalCents"`
 }
 
+// OrderPaidEvent 是支付成功之后发出去的第二个事件，由履约服务（Node）消费。
+//
+// 为什么把 items 塞进消息而不让履约服务回查 orders 表：
+// 跨服务读别人的表 = 数据库变成公共 API，改个列名就要全公司一起上线。
+// 消息是契约，表是私有的。
+type OrderPaidEvent struct {
+	OrderID    int64       `json:"orderId"`
+	UserID     int64       `json:"userId,omitempty"`
+	TotalCents int64       `json:"totalCents"`
+	PaymentID  string      `json:"paymentId,omitempty"`
+	Items      []OrderItem `json:"items"`
+}
+
+// ShipmentUpdate 是履约服务通过内部接口回写的内容。
+// status 只接受 SHIPPED / DELIVERED —— 合法的迁移由 api 侧判定，
+// 不把状态机的决定权交给调用方。
+type ShipmentUpdate struct {
+	OrderID    int64  `json:"orderId"`
+	Status     string `json:"status"`
+	TrackingNo string `json:"trackingNo"`
+	Note       string `json:"note"`
+}
+
 type CreateOrderParams struct {
 	ProductID      int64
 	Quantity       int
 	IdempotencyKey string
+	// UserID 为 0 表示匿名下单。匿名是受支持的：不登录也能买，
+	// 只是「我的订单」列表里看不到。
+	UserID int64
 }
 
 type OutboxMessage struct {

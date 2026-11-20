@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/api"
+	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/auth"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/broker"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/cache"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/config"
@@ -94,7 +95,21 @@ func main() {
 	}()
 
 	host, _ := os.Hostname()
-	srv := &api.Server{Log: log, Store: st, Cache: c, Broker: brk, Cfg: cfg, Pod: host}
+
+	// JWT 验签器是可选的：没配密钥时 api 把所有人当匿名，
+	// 本地只起 api+worker 也能完整下单。配了就按 token 归属订单。
+	var signer *auth.Signer
+	if cfg.JWTSecret != "" {
+		signer, err = auth.NewSigner(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTTTL)
+		if err != nil {
+			log.Error("jwt_signer_init_failed", "err", err)
+			os.Exit(1)
+		}
+	} else {
+		log.Warn("jwt_disabled", "reason", "JWT_SECRET 未设置，所有请求按匿名处理")
+	}
+
+	srv := &api.Server{Log: log, Store: st, Cache: c, Broker: brk, Cfg: cfg, Pod: host, Signer: signer}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,

@@ -51,9 +51,9 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 
 	var orderID int64
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO orders (status, total_cents, idempotency_key)
-		VALUES ('CREATED', $1, $2)
-		RETURNING id`, totalCents, nullIfEmpty(p.IdempotencyKey)).Scan(&orderID)
+		INSERT INTO orders (status, total_cents, idempotency_key, user_id)
+		VALUES ('CREATED', $1, $2, $3)
+		RETURNING id`, totalCents, nullIfEmpty(p.IdempotencyKey), nullIfZero(p.UserID)).Scan(&orderID)
 	if isUniqueViolation(err) {
 		// 幂等键撞了：回滚（库存自动还原），把上一次的结果原样返回
 		_ = tx.Rollback()
@@ -104,17 +104,23 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 }
 
 func (s *Store) GetOrder(ctx context.Context, id int64) (Order, error) {
-	var o Order
+	var (
+		o          Order
+		userID     sql.NullInt64
+		trackingNo sql.NullString
+	)
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT id, status, total_cents, created_at, updated_at
+		SELECT id, user_id, status, total_cents, tracking_no, created_at, updated_at
 		  FROM orders WHERE id = $1`, id).
-		Scan(&o.ID, &o.Status, &o.TotalCents, &o.CreatedAt, &o.UpdatedAt)
+		Scan(&o.ID, &userID, &o.Status, &o.TotalCents, &trackingNo, &o.CreatedAt, &o.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Order{}, ErrOrderNotFound
 	}
 	if err != nil {
 		return Order{}, err
 	}
+	o.UserID = userID.Int64
+	o.TrackingNo = trackingNo.String
 	if o.Items, err = s.orderItems(ctx, id); err != nil {
 		return Order{}, err
 	}
@@ -152,7 +158,11 @@ func (s *Store) GetOrderStatus(ctx context.Context, id int64) (string, error) {
 
 // MarkOrderPaid 用 WHERE status='CREATED' 做乐观锁，
 // 加上 order_events 的 UNIQUE(order_id, to_status)，重复消费不会把订单改成两次。
-func (s *Store) MarkOrderPaid(ctx context.Context, id int64, note string) (bool, error) {
+//
+// 关键在于 order.paid 事件和状态变更在同一个事务里写 outbox：
+// 要么「订单变 PAID 且事件待投递」，要么两者都没发生。
+// 如果先提交再发消息，中间挂掉就会出现「钱收了但货永远不发」。
+func (s *Store) MarkOrderPaid(ctx context.Context, id int64, note, paymentID string) (bool, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -174,10 +184,127 @@ func (s *Store) MarkOrderPaid(ctx context.Context, id int64, note string) (bool,
 		VALUES ($1, 'CREATED', 'PAID', $2)`, id, note); err != nil {
 		return false, err
 	}
+
+	// 组装履约服务要的完整信息。查不到 items 说明数据坏了，宁可回滚。
+	var (
+		userID sql.NullInt64
+		total  int64
+	)
+	if err := tx.QueryRowContext(ctx,
+		`SELECT user_id, total_cents FROM orders WHERE id = $1`, id).Scan(&userID, &total); err != nil {
+		return false, err
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT product_id, name, quantity, unit_price_cents
+		  FROM order_items WHERE order_id = $1 ORDER BY id`, id)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	items := make([]OrderItem, 0, 4)
+	for rows.Next() {
+		var it OrderItem
+		if err := rows.Scan(&it.ProductID, &it.Name, &it.Quantity, &it.UnitPriceCents); err != nil {
+			return false, err
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	payload, err := json.Marshal(OrderPaidEvent{
+		OrderID:    id,
+		UserID:     userID.Int64,
+		TotalCents: total,
+		PaymentID:  paymentID,
+		Items:      items,
+	})
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO outbox (topic, payload) VALUES ('order.paid', $1)`, payload); err != nil {
+		return false, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// 状态推进的三种结果。调用方必须区别对待：
+//   - ok        状态真的变了
+//   - duplicate 已经是目标状态，重复投递，不是错误
+//   - illegal   状态机不允许（比如 DELIVERED 直接跳到 PAID），需要人看
+var (
+	ErrIllegalTransition = errors.New("illegal status transition")
+)
+
+// AdvanceShipment 处理履约服务回写的发货/签收。
+//
+// 幂等的做法和 MarkOrderPaid 一致：条件更新。如果 RowsAffected=0，
+// 再查一次当前状态来判断「是重复了」还是「真的不合法」——
+// 这两种情况对调用方意味着完全不同的处理（前者 ACK，后者要告警）。
+func (s *Store) AdvanceShipment(ctx context.Context, u ShipmentUpdate) (string, error) {
+	var from string
+	switch u.Status {
+	case "SHIPPED":
+		from = "PAID"
+	case "DELIVERED":
+		from = "SHIPPED"
+	default:
+		return "", ErrIllegalTransition
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// tracking_no 用 COALESCE(NULLIF(...)) 保留旧值：
+	// DELIVERED 的回写不再带运单号，不能把已有的单号冲成 NULL。
+	res, err := tx.ExecContext(ctx, `
+		UPDATE orders
+		   SET status      = $1,
+		       tracking_no = COALESCE(NULLIF($2, ''), tracking_no),
+		       updated_at  = now()
+		 WHERE id = $3 AND status = $4`, u.Status, u.TrackingNo, u.OrderID, from)
+	if err != nil {
+		return "", err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		var cur string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM orders WHERE id = $1`, u.OrderID).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrOrderNotFound
+		}
+		if err != nil {
+			return "", err
+		}
+		if cur == u.Status {
+			return "duplicate", nil
+		}
+		return "", ErrIllegalTransition
+	}
+
+	note := u.Note
+	if note == "" {
+		note = "fulfillment: " + u.Status
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO order_events (order_id, from_status, to_status, note)
+		VALUES ($1, $2, $3, $4)`, u.OrderID, from, u.Status, note); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return "ok", nil
 }
 
 // CancelOrder 是补偿动作：状态置为 CANCELLED 并把库存加回去。
@@ -304,6 +431,15 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullIfZero 把「没登录」的 0 变成 SQL NULL。
+// 直接插 0 会撞外键（users 表没有 id=0 的行）。
+func nullIfZero(n int64) any {
+	if n == 0 {
+		return nil
+	}
+	return n
 }
 
 func isUniqueViolation(err error) bool {

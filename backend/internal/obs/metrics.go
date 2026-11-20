@@ -59,6 +59,19 @@ var (
 		Name: "shop_outbox_pending",
 		Help: "已写入但尚未投递的 outbox 行数（每 15s 采样一次）",
 	})
+
+	// action: register / login；result: ok / invalid / email_taken / bad_input / error
+	AuthEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shop_auth_events_total",
+		Help: "账号服务的注册与登录结果",
+	}, []string{"action", "result"})
+
+	// 履约服务回调 api 回写发货状态的结果。
+	// result: ok / duplicate（已经推进过，幂等命中）/ invalid（状态机不允许）/ error
+	ShipmentCallbacks = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shop_shipment_callbacks_total",
+		Help: "api 接收履约服务回写的次数",
+	}, []string{"result", "status"})
 )
 
 func Handler() http.Handler {

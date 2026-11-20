@@ -33,6 +33,17 @@ const (
 	RouteOrderRetry   = "order.created.retry"
 	RouteOrderDLQ     = "order.created.dlq"
 
+	// 支付成功之后的事件，消费方是 Node 写的履约服务。
+	// 拓扑仍然由 Go 侧声明（owner 原则）：Node 只 checkQueue + consume，
+	// 两边都声明同一个队列且参数不一致会直接 PRECONDITION_FAILED 关连接。
+	QueueOrderPaid      = "shop.order.paid"
+	QueueOrderPaidRetry = "shop.order.paid.retry"
+	QueueOrderPaidDLQ   = "shop.order.paid.dlq"
+
+	RouteOrderPaid      = "order.paid"
+	RouteOrderPaidRetry = "order.paid.retry"
+	RouteOrderPaidDLQ   = "order.paid.dlq"
+
 	RetryDelayMS = 10000
 )
 
@@ -146,6 +157,31 @@ func (b *Broker) Declare() error {
 		return fmt.Errorf("declare %s: %w", QueueOrderDLQ, err)
 	}
 	if err := ch.QueueBind(QueueOrderDLQ, RouteOrderDLQ, DLX, false, nil); err != nil {
+		return err
+	}
+
+	// ---- order.paid：支付成功 → 履约服务发货 ----
+	if _, err := ch.QueueDeclare(QueueOrderPaid, true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare %s: %w", QueueOrderPaid, err)
+	}
+	if err := ch.QueueBind(QueueOrderPaid, RouteOrderPaid, Exchange, false, nil); err != nil {
+		return err
+	}
+	paidRetryArgs := amqp.Table{
+		"x-message-ttl":             int32(RetryDelayMS),
+		"x-dead-letter-exchange":    "",
+		"x-dead-letter-routing-key": QueueOrderPaid,
+	}
+	if _, err := ch.QueueDeclare(QueueOrderPaidRetry, true, false, false, false, paidRetryArgs); err != nil {
+		return fmt.Errorf("declare %s: %w", QueueOrderPaidRetry, err)
+	}
+	if err := ch.QueueBind(QueueOrderPaidRetry, RouteOrderPaidRetry, DLX, false, nil); err != nil {
+		return err
+	}
+	if _, err := ch.QueueDeclare(QueueOrderPaidDLQ, true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare %s: %w", QueueOrderPaidDLQ, err)
+	}
+	if err := ch.QueueBind(QueueOrderPaidDLQ, RouteOrderPaidDLQ, DLX, false, nil); err != nil {
 		return err
 	}
 	return nil

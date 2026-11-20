@@ -74,7 +74,7 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	//   成功            → 继续把订单推进到 PAID
 	//   拒付 Declined   → 业务终态，重试没意义，直接取消 + 回补库存
 	//   其他 error      → 临时故障（超时/5xx），走退避重试
-	note, err := w.charge(ctx, ev, attempts, log)
+	note, paymentID, err := w.charge(ctx, ev, attempts, log)
 	var declined *payment.DeclinedError
 	switch {
 	case errors.As(err, &declined):
@@ -91,7 +91,8 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	start := time.Now()
 	// 幂等闸门 2：UPDATE ... WHERE status='CREATED' 是乐观锁，
 	// 加上 order_events 的 UNIQUE(order_id, to_status)，双保险。
-	changed, err := w.Store.MarkOrderPaid(ctx, ev.OrderID, note)
+	// order.paid 事件也在同一个事务里写 outbox，履约服务靠它触发发货。
+	changed, err := w.Store.MarkOrderPaid(ctx, ev.OrderID, note, paymentID)
 	if err != nil {
 		return w.retry(ctx, msg, ev, attempts, log, err)
 	}
@@ -111,11 +112,13 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	return nil
 }
 
-// charge 决定走真实网关还是内置模拟，返回要写进 order_events.note 的文案。
-func (w *Worker) charge(ctx context.Context, ev store.OrderCreatedEvent, attempts int, log *slog.Logger) (string, error) {
+// charge 决定走真实网关还是内置模拟，返回要写进 order_events.note 的文案和支付单号。
+// paymentID 会随 order.paid 事件传给履约服务，出问题能顺着它去网关那边对账。
+func (w *Worker) charge(ctx context.Context, ev store.OrderCreatedEvent, attempts int, log *slog.Logger) (string, string, error) {
 	if w.Pay == nil || !w.Pay.Enabled() {
 		obs.PaymentCalls.WithLabelValues("disabled").Inc()
-		return "worker: payment captured (simulated)", nil
+		// 模拟支付的单号带 sim_ 前缀，一眼就能和真实网关的区分开
+		return "worker: payment captured (simulated)", fmt.Sprintf("sim_%d", ev.OrderID), nil
 	}
 
 	// worker 没有入站 HTTP 请求，自己造一个 request id 传给网关；
@@ -123,12 +126,12 @@ func (w *Worker) charge(ctx context.Context, ev store.OrderCreatedEvent, attempt
 	rid := fmt.Sprintf("order-%d-try%d", ev.OrderID, attempts+1)
 	res, err := w.Pay.Charge(payment.WithRequestID(ctx, rid), strconv.FormatInt(ev.OrderID, 10), ev.TotalCents)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	obs.PaymentCalls.WithLabelValues("succeeded").Inc()
 	log.Info("payment_captured", "payment_id", res.PaymentID, "replayed", res.Replayed)
-	return fmt.Sprintf("worker: payment captured (%s)", res.PaymentID), nil
+	return fmt.Sprintf("worker: payment captured (%s)", res.PaymentID), res.PaymentID, nil
 }
 
 // retry 决定「再试一次」还是「认输并补偿」。

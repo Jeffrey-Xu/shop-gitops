@@ -1,0 +1,174 @@
+# 履约服务：Node.js，管「付完钱之后」的事——建发货单、生成运单、推进物流。
+# 它不写 orders 表，状态变更一律通过 api 的内部端点回写。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fulfillment
+  labels:
+    app: fulfillment
+    app.kubernetes.io/part-of: shop
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fulfillment
+  template:
+    metadata:
+      labels:
+        app: fulfillment
+        app.kubernetes.io/part-of: shop
+    spec:
+      # 比别的服务短：Node 进程收到 SIGTERM 后只要几毫秒就能关完，
+      # 给 30s 反而拖慢滚动更新
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        # node:22-alpine 里 node 用户的 uid 就是 1000
+        runAsUser: 1000
+      containers:
+        - name: fulfillment
+          image: ghcr.io/jeffrey-xu/shop-gitops/fulfillment:local1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: APP_VERSION
+              value: "v4-fulfillment"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: shop-config
+                  key: LOG_LEVEL
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: database-url
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: rabbitmq-url
+            # 回写订单状态的口令，和 api 侧 INTERNAL_TOKEN 必须是同一个值
+            - name: INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: internal-token
+            # 走 Service 名，不用 Service 的 ClusterIP：
+            # Pod 重建后 IP 会变，DNS 名不会
+            - name: SHOP_API_URL
+              value: "http://api:8080"
+            # 物流推进节拍：真实世界是天级，这里压到秒级才看得见流转
+            - name: FULFILL_TICK_MS
+              value: "6000"
+            - name: FULFILL_STEP_DELAY_MS
+              value: "12000"
+            - name: FULFILL_MAX_ATTEMPTS
+              value: "3"
+            - name: MQ_PREFETCH
+              value: "5"
+          readinessProbe:
+            # readyz 同时检查 PG 和 RabbitMQ 消费连接：
+            # 消费断了就不该算 ready，否则新订单会悄悄堆在队列里
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 30m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # readOnlyRootFilesystem 开着，Node 写临时文件会失败，给它一个可写的 /tmp
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fulfillment
+  labels:
+    app: fulfillment
+    app.kubernetes.io/part-of: shop
+spec:
+  type: ClusterIP
+  selector:
+    app: fulfillment
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fulfillment
+  labels:
+    app: fulfillment
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: fulfillment
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+# /fulfill -> 履约服务的只读查询接口。
+# 注意 POST /fulfill/shipments/{id}/advance 也会被转发出去 ——
+# 演示环境故意留着，方便手动催一单。生产必须把它挡在网关外。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fulfillment
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: shop.localhost
+      http:
+        paths:
+          - path: /fulfill(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: fulfillment
+                port:
+                  number: 8080
+    - http:
+        paths:
+          - path: /fulfill(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: fulfillment
+                port:
+                  number: 8080

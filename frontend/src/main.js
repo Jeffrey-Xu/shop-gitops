@@ -8,9 +8,24 @@ const el = {
   pod: document.getElementById('pod'),
   cache: document.getElementById('cache'),
   queue: document.getElementById('queue'),
+  who: document.getElementById('who'),
+  authOpen: document.getElementById('auth-open'),
+  logout: document.getElementById('logout'),
+  authDialog: document.getElementById('auth-dialog'),
+  authForm: document.getElementById('auth-form'),
+  authTitle: document.getElementById('auth-title'),
+  authError: document.getElementById('auth-error'),
+  authSwitch: document.getElementById('auth-switch'),
+  authSubmit: document.getElementById('auth-submit'),
+  nameRow: document.getElementById('name-row'),
 };
 
 let lastCache = '—';
+// token 放 localStorage：刷新页面不该掉登录态。
+// 代价是 XSS 能偷走它 —— 真要抗这一点得上 httpOnly cookie + CSRF token，
+// 这不是一个演示站该背的复杂度，但得知道边界在哪。
+let token = localStorage.getItem('shop.token') || '';
+let currentUser = null;
 
 function toast(msg, kind = 'ok') {
   el.toast.textContent = msg;
@@ -70,18 +85,41 @@ async function loadStats() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 下单后轮询订单状态：CREATED 是 API 写的，PAID 是 worker 异步改的。
-// 前端能看到这个过渡，就说明消息链路真的通了。
+// 订单状态的中文说明。状态机在服务端，前端只负责翻译。
+const STATUS_TEXT = {
+  CREATED: '已受理，等待支付',
+  PAID: '支付成功，等待出库',
+  SHIPPED: '已发货，运输中',
+  DELIVERED: '已签收',
+  CANCELLED: '已取消（支付失败）',
+};
+
+// 下单后轮询：CREATED 是 api 写的，PAID 是 worker 改的，
+// SHIPPED / DELIVERED 是 Node 履约服务回写的 —— 一条链上四个进程，
+// 前端能依次看到，就说明 outbox → RabbitMQ → worker/fulfillment 全通了。
 async function pollOrder(id) {
-  for (let i = 0; i < 12; i++) {
-    await sleep(800);
+  let last = '';
+  // 40 次 × 1s ≈ 40s，够覆盖 支付 + 出库 + 干线 + 签收（演示里压到了秒级）
+  for (let i = 0; i < 40; i++) {
+    await sleep(1000);
     try {
-      const res = await fetch(`${API}/orders/${id}`, { cache: 'no-store' });
+      const res = await authFetch(`${API}/orders/${id}`);
+      if (res.status === 404) {
+        // 登录后才下的单，token 过期后会查不到 —— 这种情况提示重新登录
+        toast(`订单 #${id} 查不到了，可能登录态已过期`, 'err');
+        return;
+      }
       if (!res.ok) continue;
       const o = await res.json();
+      if (o.status === last) continue;
+      last = o.status;
+
       const path = o.history.map((h) => h.toStatus).join(' → ');
-      toast(`订单 #${o.id}：${o.status}（${path}）`, o.status === 'CANCELLED' ? 'err' : 'ok');
-      if (o.status !== 'CREATED') {
+      const ship = o.trackingNo ? `　运单 ${o.trackingNo}` : '';
+      toast(`订单 #${o.id}：${STATUS_TEXT[o.status] || o.status}${ship}（${path}）`,
+        o.status === 'CANCELLED' ? 'err' : 'ok');
+
+      if (o.status === 'DELIVERED' || o.status === 'CANCELLED') {
         load();
         return;
       }
@@ -103,7 +141,7 @@ el.products.addEventListener('click', async (e) => {
   btn.textContent = '提交中…';
 
   try {
-    const res = await fetch(`${API}/orders`, {
+    const res = await authFetch(`${API}/orders`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -131,3 +169,127 @@ el.products.addEventListener('click', async (e) => {
 
 load();
 setInterval(loadStats, 5000);
+
+// ---------------------------------------------------------------------------
+// 账号：登录 / 注册 / 退出
+//
+// token 由 Go 账号服务签发，api 本地验签 —— 前端只负责存和带。
+// 下单时带上它，订单就会归属到这个用户（不带也能下单，只是匿名）。
+// ---------------------------------------------------------------------------
+
+function authFetch(url, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return fetch(url, { ...opts, headers, cache: 'no-store' });
+}
+
+function setToken(next) {
+  token = next || '';
+  if (token) localStorage.setItem('shop.token', token);
+  else localStorage.removeItem('shop.token');
+}
+
+function renderAccount() {
+  const loggedIn = Boolean(currentUser);
+  el.who.textContent = loggedIn ? (currentUser.displayName || currentUser.email) : '';
+  el.who.hidden = !loggedIn;
+  el.authOpen.hidden = loggedIn;
+  el.logout.hidden = !loggedIn;
+}
+
+async function refreshAccount() {
+  if (!token) {
+    currentUser = null;
+    renderAccount();
+    return;
+  }
+  try {
+    const res = await authFetch('/auth/me');
+    if (res.ok) {
+      currentUser = (await res.json()).user;
+    } else {
+      // token 过期或被吊销：直接清掉，别让它一直 401
+      setToken('');
+      currentUser = null;
+    }
+  } catch {
+    // 网络问题不清 token，下次刷新再试
+    currentUser = null;
+  }
+  renderAccount();
+}
+
+let authMode = 'login';
+
+function openAuth(mode) {
+  authMode = mode;
+  el.authForm.reset();
+  el.authError.hidden = true;
+  el.authTitle.textContent = mode === 'login' ? '登录' : '注册';
+  el.authSubmit.textContent = mode === 'login' ? '登录' : '注册并登录';
+  el.authSwitch.textContent = mode === 'login' ? '没有账号？去注册' : '已有账号？去登录';
+  el.nameRow.hidden = mode === 'login';
+  el.authDialog.showModal();
+}
+
+el.authOpen.addEventListener('click', () => openAuth('login'));
+
+el.authSwitch.addEventListener('click', () => {
+  openAuth(authMode === 'login' ? 'register' : 'login');
+});
+
+el.authForm.addEventListener('submit', async (e) => {
+  // 不用 method="dialog"：那样表单提交会直接关窗口，
+  // 失败时用户看不到错误，得重开一次
+  e.preventDefault();
+  const fd = new FormData(el.authForm);
+  const body = {
+    email: String(fd.get('email') || '').trim(),
+    password: String(fd.get('password') || ''),
+  };
+  if (authMode === 'register') {
+    body.displayName = String(fd.get('displayName') || '').trim();
+  }
+
+  el.authSubmit.disabled = true;
+  try {
+    const path = authMode === 'login' ? '/auth/login' : '/auth/register';
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      el.authError.textContent = data.error || `失败 HTTP ${res.status}`;
+      el.authError.hidden = false;
+      return;
+    }
+    setToken(data.token);
+    currentUser = data.user;
+    renderAccount();
+    el.authDialog.close();
+    toast(`欢迎，${currentUser.displayName || currentUser.email}`);
+  } catch (err) {
+    el.authError.textContent = '网络错误：' + err.message;
+    el.authError.hidden = false;
+  } finally {
+    el.authSubmit.disabled = false;
+  }
+});
+
+el.logout.addEventListener('click', () => {
+  // 纯前端退出：JWT 是无状态的，服务端没有会话可销毁。
+  // 真要「立刻失效」就得有吊销列表，那是另一个量级的设计。
+  setToken('');
+  currentUser = null;
+  renderAccount();
+  toast('已退出登录');
+});
+
+refreshAccount();
+
+// 深链：/#login 直接弹登录框。演示和截图时省得手点，
+// 也方便把「请先登录」的链接直接指过来。
+if (location.hash === '#login') openAuth('login');
+

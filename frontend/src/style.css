@@ -10,6 +10,11 @@
 
 * { box-sizing: border-box; }
 
+/* 这条不能省：下面给 dialog label 设了 display:flex，
+   而 flex 的优先级高于浏览器 UA 样式里的 [hidden]{display:none}，
+   结果是加了 hidden 属性的元素照样显示（登录框里的"昵称"就踩过这个坑）。 */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   padding: 32px 24px 64px;
@@ -90,3 +95,106 @@ footer {
   font-size: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+
+/* ---- 账号区 ---- */
+
+.head-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding-top: 4px;
+}
+
+.who {
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* button 全局是撑满宽度的（给商品卡片用），这里要收回成内联尺寸 */
+button.ghost {
+  width: auto;
+  padding: 6px 12px;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--line);
+}
+
+button.ghost:hover { background: var(--card); }
+
+/* ---- 登录弹层 ---- */
+
+dialog {
+  padding: 22px;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+dialog::backdrop { background: rgba(31, 31, 30, 0.35); }
+
+dialog h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+  font-weight: 500;
+}
+
+dialog form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 300px;
+}
+
+dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+dialog input {
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+dialog input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.auth-error {
+  margin: 0;
+  font-size: 13px;
+  color: var(--danger);
+}
+
+.auth-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.auth-actions button { width: auto; }
+.auth-actions #auth-submit { padding: 8px 18px; }
+

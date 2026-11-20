@@ -1,0 +1,22 @@
+{
+  "name": "shop-fulfillment",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "shop 履约服务：消费 order.paid，建发货单、推进物流状态、回写订单",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.5",
+    "fastify": "^5.2.0",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "prom-client": "^15.1.3"
+  }
+}

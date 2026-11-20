@@ -1,0 +1,146 @@
+# 账号服务：Go 写的第三个二进制，和 api/worker 共用同一个镜像。
+# 独立 Deployment 的理由：bcrypt 是 CPU 密集的（每次注册/登录几十毫秒），
+# 和商品浏览放一个进程里会互相挤占；而且它挂了不该影响下单。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account
+  labels:
+    app: account
+    app.kubernetes.io/part-of: shop
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: account
+  template:
+    metadata:
+      labels:
+        app: account
+        app.kubernetes.io/part-of: shop
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: account
+          image: ghcr.io/jeffrey-xu/shop-gitops/backend:bootstrap
+          imagePullPolicy: IfNotPresent
+          # 同一个镜像，换入口就是另一个角色
+          command: ["/app/account"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: shop-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: database-url
+            # 签发 JWT 的密钥。没有它服务直接拒绝启动 ——
+            # 也不允许自动生成，否则重启后所有已发出的 token 全部失效。
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: jwt-secret
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            # bcrypt 峰值吃 CPU，给 200m 上限防止它把节点 CPU 抢光
+            requests:
+              cpu: 30m
+              memory: 48Mi
+            limits:
+              cpu: 400m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account
+  labels:
+    app: account
+    app.kubernetes.io/part-of: shop
+spec:
+  type: ClusterIP
+  selector:
+    app: account
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: account
+  labels:
+    app: account
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: account
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+# /auth/register -> /register，/auth/login -> /login。
+# 用正则 + rewrite-target 而不是在服务里改成 /auth/* 前缀：
+# 服务本身不该知道自己挂在哪个路径下，那是网关的事。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: account
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: shop.localhost
+      http:
+        paths:
+          - path: /auth(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: account
+                port:
+                  number: 8080
+    # 兜底：不带 Host 直接访问 localhost 也能用
+    - http:
+        paths:
+          - path: /auth(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: account
+                port:
+                  number: 8080
