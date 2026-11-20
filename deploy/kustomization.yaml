@@ -20,15 +20,15 @@ images:
   # 内容等价于 backend 主干 + payment 客户端接线。
   # fulfill1 = 加了 account 二进制的那一版（同样走本地交叉编译打包）。
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: 6143ae3f3e0febab03c8bf80e15bf6364e117241
+    newTag: 1545776527ee579c13025ae5c5bde6963c16a413
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: 6143ae3f3e0febab03c8bf80e15bf6364e117241
+    newTag: 1545776527ee579c13025ae5c5bde6963c16a413
   # 支付服务是 Python，镜像单独构建；本地用 Docker 直接 build 出 local1 这个 tag
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
     newTag: local1
   # 履约服务是 Node，镜像单独构建
   - name: ghcr.io/jeffrey-xu/shop-gitops/fulfillment
-    newTag: 6143ae3f3e0febab03c8bf80e15bf6364e117241
+    newTag: 1545776527ee579c13025ae5c5bde6963c16a413
 labels:
   - pairs:
       app.kubernetes.io/managed-by: argocd
