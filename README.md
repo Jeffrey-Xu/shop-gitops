@@ -39,7 +39,7 @@
 | `fulfillment-service/` | Node 22 + Fastify，消费 `order.paid`，建发货单、推进物流、回写订单 |
 | `deploy/` | Kustomize：namespace、api/worker/account/frontend/payment/fulfillment、ingress、monitoring |
 | `argocd/` | ArgoCD 引导清单（`install.yaml` 不进 Git） |
-| `monitoring/` | metrics-server / kube-prometheus-stack / loki / alloy 的 Application |
+| `monitoring/` | metrics-server / kube-prometheus-stack / loki / alloy / tempo 的 Application |
 | `monitoring/extras/` | mailpit、宿主 PG/Redis exporter、Grafana 业务大盘（由 `monitoring-extras` 这个 Application 管） |
 | `scripts/` | `git-doctor.sh` 推送链路诊断、`push-via-api.py` 兜底提交、`build-frontend-local.sh` 本地出前端镜像 |
 | `.github/workflows/ci.yaml` | 矩阵构建 + 回写 tag |
@@ -392,12 +392,12 @@ rabbitmq-plugins enable rabbitmq_prometheus
 
 **③ ArgoCD 引导**
 
-`argocd/install.yaml` 故意**不进 Git**（它是 bootstrap 用的 v3.6.1 清单），装完后手工 apply 5 个 Application：
+`argocd/install.yaml` 故意**不进 Git**（它是 bootstrap 用的 v3.6.1 清单），装完后手工 apply，Application 全是「一个 yaml 一个 App」：
 
 ```bash
 kubectl apply -f argocd/install.yaml -n argocd    # 首次
 kubectl apply -f argocd/application.yaml          # shop
-kubectl apply -f monitoring/                      # 4 个平台 Application
+kubectl apply -f monitoring/*.yaml                # 7 个平台 Application（含 tempo）
 ```
 
 ## 本地访问
@@ -423,7 +423,7 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 ## 可观测性
 
-集群内 `monitoring` 命名空间，5 个 Application 全由 ArgoCD 管：
+集群内 `monitoring` 命名空间，7 个 Application 全由 ArgoCD 管：
 
 | 组件 | Chart / 来源 | 说明 |
 |---|---|---|
@@ -431,6 +431,7 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 | kube-prometheus-stack | 93.4.0 | Prometheus + Grafana + Alertmanager + node-exporter + KSM + operator |
 | loki | 7.6.0 | SingleBinary + filesystem，`retention_period: 168h` |
 | alloy | 1.16.0 | DaemonSet，走 API 读容器日志，`stage.cri` + `stage.json` |
+| tempo | 1.24.4（app 2.9.0） | SingleBinary + filesystem，`retention: 24h`，OTLP 4317/4318 |
 | monitoring-extras | 本仓库 `monitoring/extras` | mailpit、postgres-exporter、redis-exporter、业务大盘 |
 
 **Metric 链路**：应用 `/metrics`（`prometheus/client_golang` + `promauto`）→ `ServiceMonitor`（15s）→ Prometheus（TSDB，7d / 4GB / 8Gi PVC）→ Grafana + 3 条 `PrometheusRule` 告警。
@@ -443,7 +444,7 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 一个多语言的坑：`prom-client` 的 `Gauge.get()` 返回结构跟着版本变，**健康检查不要反过来读指标库的内部结构**（`fulfillment` 的 `/readyz` 就这么崩过一次）。指标是给 Prometheus 的，业务判断自己维护状态。
 
-**Log 链路**：slog JSON → stdout → Alloy（`discovery.kubernetes` + `loki.source.kubernetes`，不挂 hostPath）→ `stage.cri` 拆行 → `stage.json` 取 `level`/`msg` → `level` 做成 label，`request_id`/`order_id`/`service` 放 structured metadata → `loki-gateway` → Loki（10Gi PVC）。
+**Log 链路**：slog JSON → stdout → Alloy（`discovery.kubernetes` + `loki.source.kubernetes`，不挂 hostPath）→ `stage.cri` 拆行 → `stage.json` 取 `level`/`msg` → `level` 做成 label，`request_id`/`order_id`/`service`/`trace_id` 放 structured metadata → `loki-gateway` → Loki（10Gi PVC）。
 
 三种语言的日志格式是**对齐过的**，Alloy 那边一条 pipeline 通吃：
 
@@ -458,7 +459,40 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 **告警投递**：Alertmanager → SMTP → mailpit（`mailpit.localhost`）→ `oncall@shop.local`。默认 receiver 是 `null`（只 fire 不通知），现在改成 email；`route` 里那条 Watchdog 子路由仍指向 `null`，所以 receivers 里必须保留一个名为 `"null"` 的空接收器，否则 operator 报 `undefined receiver "null"` 拒绝渲染。
 
-**Tracing：没有。** 全仓库没有 OTel SDK / Collector / Tempo。跨 `api → RabbitMQ → worker` 目前只能靠 `request_id` + `order_id` 在 Loki 里手工串；没有父子 span，也就无法回答“这 800ms 里 PG 占了多少”。
+**Trace 链路**：OTel SDK（Go / Node / Python 各一套）→ OTLP/HTTP → Tempo → Grafana。一单从 `POST /api/orders` 到发货回写，是一条 trace：
+
+```
+api            POST /api/orders                       SERVER
+ └─ publish order.created                            PRODUCER   ← outbox relay，2s 后
+     └─ consume shop.order.created                   CONSUMER   ← worker
+         ├─ POST /charge                             CLIENT
+         │   └─ POST /charge                         SERVER     ← payment（Python）
+         └─ publish order.paid                       PRODUCER
+             └─ consume shop.order.paid              CONSUMER   ← fulfillment
+                 ├─ INSERT INTO shipments            CLIENT     ← pg
+                 └─ POST /api/internal/shipments     CLIENT
+                     └─ POST /api/internal/shipments SERVER     ← 回到 api
+```
+
+四个必须记住的决定：
+
+1. **`traceparent` 跟着 outbox 行落库**（`outbox.traceparent`，迁移 0004）。relay 是 2 秒轮询驱动的，下单请求的 span 到那时早就结束了，context 传不过去。不落库，链路会在「事务 → 轮询 → 发布」这里断成两条互不相干的 trace。这是整条链路里唯一一处不能靠传播、只能靠持久化的地方。
+2. **AMQP 的注入/还原写在 `broker` 包里**，不在业务代码里。`PublishTo` 开 producer span 并注入消息头，`Consume` 从消息头还原 ctx 再交给 handler —— 于是重试链路自动接在上一段下面（一条 trace 里能看完三次失败加一次成功）。amqp091 的 `Headers` 是 `map[string]any`，值里混着 `int32`，所以有个 `amqpCarrier` 只把字符串当传播载体。
+3. **重试会拉长同一条 trace**。每次重试是「再投一条新消息」，带着上一段的 `traceparent`，所以第 4 次尝试是第 3 次的子 span。好处是失败现场完整，代价是 trace 时长包含三次 10s 的退避等待。
+4. **物流推进单独成 trace**，不挂在支付那条上。`fulfillment` 的定时器隔几十秒推一档，塞进同一条 trace 会让它长得没法读，也会毁掉「下单链路耗时」这个指标。两条 trace 用 `order.id` 关联。
+
+服务名与采样：`OTEL_SERVICE_NAME` 按 Deployment 给（三个 Go 服务共用一个镜像），endpoint/采样率放在 `shop-config` 一份。默认全采（`OTEL_TRACES_SAMPLER_ARG=1.0`）—— 本地量小，演示时不能出现「这单刚好没被采到」。批量导出 2 秒（默认 5 秒会让人以为链路没接上）。探针与 `/metrics` 不采，否则 Tempo 里绝大多数 span 是 kubelet。
+
+**日志 ↔ 链路**两个方向都通了，靠的是显式写死的 `uid`：
+
+| 方向 | 配置 | 说明 |
+|---|---|---|
+| 日志 → trace | Loki `derivedFields` | 正则抓日志里的 `"trace_id":"<32hex>"`，点一下跳 Tempo |
+| trace → 日志 | Tempo `tracesToLogsV2` | `{namespace="shop"} \|= "${__span.traceId}"`，一单跨 5 个服务，按命名空间捞比按服务捞有用 |
+
+> Grafana 的 provisioning 文件里，`$` 必须写成 `$$`：Grafana 读文件时会把 `$` 当环境变量插值，直接写 `${__value.raw}` 会查不到这个环境变量、被替换成空串，链接点开是空的而且不报错。反过来写成 `$$` 时，Helm 不会帮你还原 —— 它原样存进去，由 Grafana 还原。这两种写法我都试过，只有 `$$` 是对的。
+
+> 数据源必须显式给 `uid`（`loki` / `tempo`）。默认是随机串，两个方向的跳转都按 uid 引用，随机串意味着「重建一次 Grafana 就断一次」，且断得没有报错。
 
 > ServiceMonitor **必须**带 `release: kube-prometheus-stack` 标签，否则静默不抓。
 
@@ -552,12 +586,12 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - ~~没有「我的订单」列表接口~~：已加 `GET /api/orders`，只按 token 里的 uid 查，明细和状态历史用两条 `= ANY($1)` 批量补齐，不做 N+1。仍然没有分页——订单多了要改游标，offset 会漏单
 - JWT 无法吊销：纯无状态，退出登录只是前端删 token。要立刻失效得上黑名单或 RS256 + 短 access + refresh
 - 前端 token 存 `localStorage`，XSS 可直接读走
-- 支付镜像是本地 `docker build` 的 `local1` tag，没走 CI；集群重置后要重新 build 并导入节点（`docker save | docker exec -i desktop-worker ctr -n k8s.io images import -`）
+- 支付镜像是本地 `docker build` 的 `local2` tag，没走 CI；集群重置后要重新 build 并导入节点（`docker save | docker exec -i desktop-worker ctr -n k8s.io images import -`）
 - `backend:fulfill1` / `frontend:fulfill1` / `fulfillment:local1` 同样是本地镜像：Docker Hub 不可达时拉不到 `golang:1.24-alpine` 和 `nginx:1.27-alpine`，于是宿主机交叉编译后借现成镜像的运行层重新打包（见下文「Docker Hub 挂了怎么出镜像」）
 - **同 tag 重建镜像后必须重新导入节点**：`imagePullPolicy: IfNotPresent` + containerd 里有同名 tag 的旧 manifest 时，`rollout restart` 用的还是旧镜像，症状是「代码明明改了却没生效」。要么换 tag，要么 `docker save | ctr import`
 - worker 调支付是**同步 HTTP**，3s 超时；支付服务慢会直接压到消费者的消费速率（prefetch=5 时最多 5 个并发卡在等）
 - Alloy 的 River 配置写 `#` 注释会**静默**失效（reload 报错但继续跑旧配置，ArgoCD 依旧 Synced/Healthy）；排查方式是看 alloy 日志里的 `failed to reload config`
-- 没有 tracing：跨 api→MQ→worker→fulfillment→api 只能靠 `request_id`/`order_id` 手工串日志
+- ~~没有 tracing~~：已接 OTel + Tempo，一单跨 5 个进程是一条 trace。剩下的缺口是**没有 Collector**（应用直连 Tempo，将来要加尾采样/脱敏得在前面插一层），以及物流推进是独立 trace（按 `order.id` 关联，不硬挂在支付那条上）
 - `/api/internal/*` 和 `/fulfill/*` 都暴露在同一个 Ingress 后面，只靠 token 和应用层挡；生产应该在网关层加路径拒绝
 
 ## Docker Hub 不可达时怎么出镜像
