@@ -574,10 +574,13 @@ GET  /healthz /readyz /metrics
 ## 故障演练
 
 ```bash
-# 制造 panic / 慢请求 / 500，用来在 Grafana 里看链路
-curl -X POST 'http://localhost/api/dev/fault?type=panic'
-curl -X POST 'http://localhost/api/dev/fault?type=slow'
-curl -X POST 'http://localhost/api/dev/fault?type=error'
+# 制造 panic / 慢请求 / 500，用来在 Grafana 里看链路。
+# 除了 DEV_MODE=true，还要带服务间密钥 —— 否则任何能访问 api 的人
+# 都能 curl ?type=panic 把 Pod 打挂。
+TOKEN=$(kubectl -n shop get secret shop-secret -o jsonpath='{.data.internal-token}' | base64 -d)
+curl -X POST "http://localhost/api/dev/fault?type=panic" -H "X-Internal-Token: $TOKEN"
+curl -X POST "http://localhost/api/dev/fault?type=slow"  -H "X-Internal-Token: $TOKEN"
+curl -X POST "http://localhost/api/dev/fault?type=error" -H "X-Internal-Token: $TOKEN"
 
 # 队列堆积：停掉 worker 后下单，队列涨、订单停在 CREATED
 kubectl -n shop scale deploy/worker --replicas=0
