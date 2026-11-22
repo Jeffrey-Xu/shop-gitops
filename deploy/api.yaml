@@ -87,15 +87,15 @@ spec:
                 name: shop-config
           env:
             # 连接串含口令，放 Secret；同名 env 优先级高于 envFrom
-            # 服务名进 span 的 service.name：Grafana 里按服务筛 trace 全靠它。
-            # 三个 Go 服务同一个镜像，这里必须按 Deployment 分开给。
-            - name: OTEL_SERVICE_NAME
-              value: "api"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: shop-secret
                   key: database-url
+            # 服务名进 span 的 service.name：Grafana 里按服务筛 trace 全靠它。
+            # 三个 Go 服务同一个镜像，这里必须按 Deployment 分开给。
+            - name: OTEL_SERVICE_NAME
+              value: "api"
             - name: RABBITMQ_URL
               valueFrom:
                 secretKeyRef:

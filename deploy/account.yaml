@@ -40,14 +40,14 @@ spec:
                 name: shop-config
           env:
             - name: DATABASE_URL
-            # 服务名进 span 的 service.name：Grafana 里按服务筛 trace 全靠它。
-            # 三个 Go 服务同一个镜像，这里必须按 Deployment 分开给。
-            - name: OTEL_SERVICE_NAME
-              value: "account"
               valueFrom:
                 secretKeyRef:
                   name: shop-secret
                   key: database-url
+            # 服务名进 span 的 service.name：Grafana 里按服务筛 trace 全靠它。
+            # 三个 Go 服务同一个镜像，这里必须按 Deployment 分开给。
+            - name: OTEL_SERVICE_NAME
+              value: "account"
             # 签发 JWT 的密钥。没有它服务直接拒绝启动 ——
             # 也不允许自动生成，否则重启后所有已发出的 token 全部失效。
             - name: JWT_SECRET
