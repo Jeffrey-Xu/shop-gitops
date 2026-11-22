@@ -56,6 +56,11 @@ func Open(ctx context.Context, dsn string, log *slog.Logger, maxOpen, maxIdle in
 			// 每个结果行一条 event 是 O(行数) 的噪声，一条几十行的查询
 			// 就能把单条 trace 撑到上千个 event。
 			RowsNext: false,
+			// 连 sql.rows 这个 span 也不要。实测一单里有 6 个同名
+			// sql.rows（QueryRow 也会产生），瀑布图上就是一片无信息量的
+			// 细条，反而把 UPDATE products / INSERT outbox 这些真正的
+			// 语句淹掉。本项目的结果集都在几十行内，迭代耗时没有排查价值。
+			OmitRows:       true,
 			DisableErrSkip: true,
 			// prepare / reset_session 是连接池内部动作，不是业务交互。
 			OmitConnPrepare:      true,

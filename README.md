@@ -58,11 +58,17 @@
 | POST | `/api/dev/fault?type=panic\|slow\|error` | 故障注入，仅 `DEV_MODE=true` 时存在 |
 | GET | `/metrics` | Prometheus 指标（api 与 worker 各一份） |
 | GET | `/healthz` | liveness，不查任何依赖 |
-| GET | `/readyz` | readiness，查 PG **和** Redis，任一失败即 503 |
+| GET | `/readyz` | readiness，PG 是**硬**依赖（失败 503），Redis 是**软**依赖（失败仍 200，响应里 `redis: "degraded"`） |
 | POST | `/api/internal/shipments` | **服务间专用**：履约服务回写 `SHIPPED`/`DELIVERED`，需 `X-Internal-Token` |
 
 > `healthz` 与 `readyz` 分开：依赖挂了应该摘流量，不该被 liveness 反复重启。
-> 注意 `readyz` 目前把 Redis 当成硬依赖，Redis 挂会导致整个 api 摘流量——见「已知限制」。
+>
+> 两个依赖的地位不一样，这不是漏改：**PG 挂了几乎每个接口都会 500**，留着接流量只是放大错误；
+> **Redis 只承担商品目录缓存，下单链路一次都不读它**，挂了应该穿透回源、吞吐掉一截但仍然能下单。
+> 把它当硬依赖的后果是：一次缓存抖动让整个 api 被摘流量 —— 明明能服务，自己主动不服务了。
+> 判据是**调用路径**，不是组件本身：将来出现真正依赖 Redis 的强一致需求（分布式锁、限流），这个判断要跟着改。
+> 降级状态会体现在 `shop_dependency_up{dependency="redis",mode="soft"}`、`shop_dependency_flaps_total`
+> 和一条只在**状态翻转时**打的 `redis_degraded` 日志上（探针每 5 秒一次，每次都打就是噪音）。
 >
 > `/api/internal/*` 是靠共享密钥挡的（`INTERNAL_TOKEN` 为空时该端点直接 404）。
 > 生产环境还应该在 Ingress 层再拦一次——应用层鉴权不该是唯一一道门。
@@ -459,20 +465,35 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 **告警投递**：Alertmanager → SMTP → mailpit（`mailpit.localhost`）→ `oncall@shop.local`。默认 receiver 是 `null`（只 fire 不通知），现在改成 email；`route` 里那条 Watchdog 子路由仍指向 `null`，所以 receivers 里必须保留一个名为 `"null"` 的空接收器，否则 operator 报 `undefined receiver "null"` 拒绝渲染。
 
-**Trace 链路**：OTel SDK（Go / Node / Python 各一套）→ OTLP/HTTP → Tempo → Grafana。一单从 `POST /api/orders` 到发货回写，是一条 trace：
+**Trace 链路**：OTel SDK（Go / Node / Python 各一套）→ OTLP/HTTP → Tempo → Grafana。一单从 `POST /api/orders` 到发货回写，是一条 trace。下面是真跑一单抓下来的（订单 53，`duration 2260ms`，其中 1.8s 是两次 outbox 轮询的等待）：
 
 ```
-api            POST /api/orders                       SERVER
- └─ publish order.created                            PRODUCER   ← outbox relay，2s 后
-     └─ consume shop.order.created                   CONSUMER   ← worker
-         ├─ POST /charge                             CLIENT
-         │   └─ POST /charge                         SERVER     ← payment（Python）
-         └─ publish order.paid                       PRODUCER
-             └─ consume shop.order.paid              CONSUMER   ← fulfillment
-                 ├─ INSERT INTO shipments            CLIENT     ← pg
-                 └─ POST /api/internal/shipments     CLIENT
-                     └─ POST /api/internal/shipments SERVER     ← 回到 api
+api            POST /api/orders                      SERVER      72.5ms
+ ├─ sql.conn.begin_tx                                CLIENT
+ ├─ UPDATE products                                  CLIENT      12.5ms  ← 扣库存（条件更新 + RETURNING）
+ ├─ INSERT orders                                    CLIENT       9.2ms
+ ├─ INSERT order_items                               CLIENT       5.1ms
+ ├─ INSERT order_events                              CLIENT       2.1ms
+ ├─ INSERT outbox                                    CLIENT       8.6ms  ← traceparent 一起落库
+ ├─ sql.tx.commit                                    CLIENT       2.7ms
+ └─ publish order.created                             PRODUCER    +216ms  ← outbox relay 轮到它
+     └─ consume shop.order.created                    CONSUMER    368.2ms ← worker
+         ├─ SELECT orders                             CLIENT       7.8ms  ← 幂等闸门：只有 CREATED 才处理
+         ├─ POST /charge                              CLIENT      63.8ms
+         │   └─ POST /charge                          SERVER      43.3ms  ← payment（Python）
+         ├─ UPDATE orders                             CLIENT     140.1ms
+         ├─ INSERT order_events                       CLIENT       2.8ms
+         ├─ SELECT orders / SELECT order_items        CLIENT
+         ├─ INSERT outbox                             CLIENT
+         ├─ sql.tx.commit                             CLIENT
+         └─ publish order.paid                        PRODUCER    +2119ms
+             └─ consume shop.order.paid               CONSUMER     35.3ms ← fulfillment
+                 ├─ pg.query:INSERT shop              CLIENT      32.4ms  ← pg（Node 侧叫法不同）
+                 └─ POST /api/internal/shipments      CLIENT
 ```
+
+> Go 侧的 SQL span 来自 **`otelsql`**（包在 `database/sql` 这一层，覆盖全部查询位置）。span 名是「操作 + 表名」（`SELECT orders` / `INSERT outbox`），**不是整条 SQL**——后者参数不同就是新名字，基数会随数据量增长，Tempo 里按名字聚合立刻失效。完整语句在 `db.query.text` 属性里。
+> 采集上刻意关掉了 `Ping`（readyz 每 5 秒一次）、`RowsNext`（每行一个 event）、`sql.rows`（实测一单里 6 个同名细条，把真正的语句淹掉）、prepare/reset_session（连接池内部动作）。原则和「探针不采 span」一样：**能被定时器驱动的东西不要进 trace**。
 
 四个必须记住的决定：
 
@@ -576,10 +597,10 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 
 ## 已知限制
 
-- `readyz` 把 Redis 当硬依赖：Redis 挂了整站 503，而实际上下单链路不需要它
-- `MaxOpenConns(10)` 与 `MaxIdleConns(5)` 硬编码在 `store.go`，且 idle 应等于 open
-- DSN 没设 `statement_timeout`，慢查询会一直占着连接
-- `CreateOrder` 提交后又回查三次拿详情，多两次往返
+- ~~`readyz` 把 Redis 当硬依赖~~：已改成 PG 硬 / Redis 软（见上文 API 表下的说明）。顺带修了同一件事的另一半 —— `cache.New` 原来在启动时 ping 失败就 `os.Exit(1)`，那等于「运维重启 Redis 的 30 秒里 Pod 反复 CrashLoop，退避越起越慢，缓存早就恢复了服务还没起来」
+- ~~`MaxOpenConns` / `MaxIdleConns` 硬编码~~：已进 `shop-config`（`DB_MAX_OPEN_CONNS` / `DB_MAX_IDLE_CONNS` / `DB_CONN_MAX_LIFETIME`），idle 默认等于 open
+- ~~DSN 没设 `statement_timeout` / `application_name`~~：已在 `config.withDBParams` 里按服务注入（迁移的 DDL 用 `SET LOCAL statement_timeout = 0` 豁免，且不会随连接回池泄漏）
+- ~~`CreateOrder` 提交后又回查三次拿详情~~：已改成 `RETURNING id, created_at, updated_at` + 用内存里的明细直接构造
 - 单副本、无 HPA/PDB、无 NetworkPolicy
 - `Idempotency-Key` 仍由前端生成，服务端不校验格式
 - ~~**存量订单不会自动发货**~~：已修。`backend/cmd/backfill` 给「PAID 且无 `order.paid` 事件」的订单补 outbox，实测 31 张单全部补发到位。做法见「支付之后：从 PAID 到 DELIVERED」小节
@@ -591,8 +612,9 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - **同 tag 重建镜像后必须重新导入节点**：`imagePullPolicy: IfNotPresent` + containerd 里有同名 tag 的旧 manifest 时，`rollout restart` 用的还是旧镜像，症状是「代码明明改了却没生效」。要么换 tag，要么 `docker save | ctr import`
 - worker 调支付是**同步 HTTP**，3s 超时；支付服务慢会直接压到消费者的消费速率（prefetch=5 时最多 5 个并发卡在等）
 - Alloy 的 River 配置写 `#` 注释会**静默**失效（reload 报错但继续跑旧配置，ArgoCD 依旧 Synced/Healthy）；排查方式是看 alloy 日志里的 `failed to reload config`
-- ~~没有 tracing~~：已接 OTel + Tempo，一单跨 5 个进程是一条 trace。剩下的缺口是**没有 Collector**（应用直连 Tempo，将来要加尾采样/脱敏得在前面插一层），以及物流推进是独立 trace（按 `order.id` 关联，不硬挂在支付那条上）
+- ~~没有 tracing~~：已接 OTel + Tempo，一单跨 5 个进程是一条 trace。Go 侧的 SQL 也采上了（`otelsql`，span 名是 `SELECT orders` 这种「操作 + 表名」）。剩下的缺口是**没有 Collector**（应用直连 Tempo，将来要加尾采样/脱敏得在前面插一层），以及物流推进是独立 trace（按 `order.id` 关联，不硬挂在支付那条上）
 - `/api/internal/*` 和 `/fulfill/*` 都暴露在同一个 Ingress 后面，只靠 token 和应用层挡；生产应该在网关层加路径拒绝
+- **连接池没有可观测性**：池大小可调了，但 `sql.DBStats` 没导出成 Prometheus 指标，所以「压测时到底撞没撞到 10 个连接」还是看不出来。要接 `otelsql.RegisterDBStatsMetrics` 就得再架一个 otel→Prometheus 的桥，暂时没做
 
 ## Docker Hub 不可达时怎么出镜像
 
