@@ -684,7 +684,7 @@
       "id": 17,
       "type": "timeseries",
       "title": "对账：钱与订单状态不一致",
-      "description": "stuck_paid=已扣款但订单仍 CREATED；paid_but_cancelled=已扣款但订单已作废；另外两类只报警不自动处置。指标只统计超过 2 分钟宽限期的单",
+      "description": "五类对账差异。stuck_paid=已扣款但订单仍 CREATED；stuck_unpaid=订单停在 CREATED 且网关查无此单；paid_but_cancelled=已扣款但订单已作废；另两类只报警不自动处置。指标只统计超过 2 分钟宽限期的单",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -720,7 +720,7 @@
       "id": 18,
       "type": "stat",
       "title": "对账差异总数",
-      "description": "四类之和。/app/reconcile 可看明细并处置",
+      "description": "五类之和。/app/reconcile 可看明细并处置",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"

@@ -33,7 +33,7 @@
 | `backend/cmd/account/` | 账号服务入口，注册/登录/签发 JWT |
 | `backend/cmd/backfill/` | 一次性运维工具：给「已 PAID 但无 `order.paid` 事件」的存量订单补 outbox，默认 dry-run |
 | `backend/cmd/replay/` | 运维工具：把 DLQ 里的消息重投回主队列（清 attempts、保留 traceparent），默认 dry-run |
-| `backend/cmd/reconcile/` | 运维工具：对账。找出「钱」与「订单状态」对不上的单，前推漏结的、退款已扣款却作废的，默认 dry-run |
+| `backend/cmd/reconcile/` | 运维工具：对账。五类差异（含「从未扣款」的卡死单），前推漏结的、退款已扣款却作废的，默认 dry-run |
 | `backend/internal/` | `config` `obs` `httpx` `cache` `store` `broker` `outbox` `api` `worker` `account` `auth` `payment` |
 | `backend/internal/store/migrations/` | `go:embed` 的 SQL 迁移，启动时同步执行，失败即退出 |
 | `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管。`src/art.js` 画商品矢量图，`src/cart.js` 管购物车，`src/api.js` 收口所有请求 |
@@ -57,7 +57,7 @@
 | GET | `/api/orders` | **需登录**：当前用户自己的订单列表（含明细与状态历史），只按 token 里的 uid 查 |
 | GET | `/api/orders/{id}` | 订单详情含状态迁移历史 |
 | GET | `/api/stats` | 缓存命中率、队列深度、各状态订单数，前端 footer 用 |
-| POST | `/api/dev/fault?type=panic\|slow\|error` | 故障注入，仅 `DEV_MODE=true` 时存在 |
+| POST | `/api/dev/fault?type=panic\|slow\|error` | 故障注入。需 `DEV_MODE=true` **且**带对 `X-Internal-Token` |
 | GET | `/metrics` | Prometheus 指标（api 与 worker 各一份） |
 | GET | `/healthz` | liveness，不查任何依赖 |
 | GET | `/readyz` | readiness，PG 是**硬**依赖（失败 503），Redis 是**软**依赖（失败仍 200，响应里 `redis: "degraded"`） |
@@ -357,7 +357,7 @@ Ingress   shop               shop.localhost + 无 host 兜底
           payment            /pay(/|$)(.*)      → rewrite /$2
           fulfillment        /fulfill(/|$)(.*)  → rewrite /$2
 ServiceMonitor api / worker / account / payment / fulfillment
-PrometheusRule shop         7 条告警
+PrometheusRule shop         8 条告警
 ```
 
 - 六个 Deployment 都是 `replicas: 1` + `strategy: Recreate`。本地学习环境，不做高可用
@@ -461,7 +461,7 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 
 **Metric 链路**：应用 `/metrics`（`prometheus/client_golang` + `promauto`）→ `ServiceMonitor`（15s）→ Prometheus（TSDB，7d / 4GB / 8Gi PVC）→ Grafana + 7 条 `PrometheusRule` 告警。
 
-- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_payment_calls_total`（`result=succeeded|declined|error|already_charged|disabled`）、`shop_queue_messages{queue}`（6 个队列全采）、`shop_outbox_pending`、`shop_outbox_oldest_seconds`、`shop_payment_mismatch{kind}`（对账差异，只统计超过 2 分钟宽限期的）、`shop_auth_events_total`（`action=register|login`）、`shop_shipment_callbacks_total`（`result=ok|duplicate|invalid|not_found|error`）。
+- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_payment_calls_total`（`result=succeeded|declined|error|already_charged|amount_mismatch|rejected|disabled`）、`shop_queue_messages{queue}`（6 个队列全采）、`shop_outbox_pending`、`shop_outbox_dead`（已放弃投递）、`shop_outbox_oldest_seconds`、`shop_payment_mismatch{kind}`（五类对账差异，只统计超过 2 分钟宽限期的）、`shop_auth_events_total`（`action=register|login`）、`shop_shipment_callbacks_total`（`result=ok|duplicate|invalid|not_found|error`）。
   - `shop_queue_messages` 覆盖两个主队列、两个重试队列、两个 DLQ。只盯主队列时 DLQ 完全不可见，而「主队列空 + DLQ 非空」正是「系统看着正常、钱收不回来」的形态。
   - `shop_outbox_oldest_seconds` 比 `pending` 更能说明链路在不在动：broker 半通时积压涨得很慢，计数看着还行，最老那条已经躺了几分钟。relay 健康时这个值只有几秒（一个轮询周期）。
 - 告警：5xx 比例 >5%、主队列积压 >10、**任一 DLQ >0（1 分钟，critical）**、**outbox 最老一条 >60s（2 分钟，critical）**、**对账差异 >0（critical：钱收了货不发 / 钱收了单作废）**、账实不符（金额或扣款结果，warning）、outbox 积压 >20（warning）。outbox 那两条的区分是刻意的：量大但年龄小是吞吐跟不上，年龄单调增长才是卡死。
@@ -616,8 +616,9 @@ kubectl -n shop exec deploy/api -- /app/replay -apply
 
 # ---- 对账：钱和订单状态对不上 ----
 #
-# 四类差异对应四种处置，工具会按类型分组打印「影响」和「该怎么办」：
+# 五类差异对应五种处置，工具会按类型分组打印「影响」和「该怎么办」：
 #   stuck_paid          已扣款、订单还 CREATED   → 前推到 PAID
+#   stuck_unpaid        未扣款、订单停 CREATED   → 只报告（查 DLQ / backfill）
 #   paid_but_cancelled  已扣款、订单已 CANCELLED → 全额退款
 #   amount_mismatch     扣款金额 ≠ 订单金额      → 只报告
 #   paid_but_declined   订单 PAID、网关 failed   → 只报告
@@ -688,29 +689,26 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - **对账是直接读网关的库**：`payments` / `refunds` 和 `orders` 在同一个 PG 里，所以对账能一条 SQL JOIN 完。真实的第三方网关不会给你库，只能靠结算文件、对账 API 或 T+1 批处理，并且要按网关的账期切时间窗口。这个简化让「发现差异」很容易，但**发现差异的能力不该被这个巧合绑架**——换成真实网关时，`ScanMismatches` 里那条 SQL 就是第一个要重写的地方
 - **对账没有定时跑**：15s 采样只负责导出指标（发现），动手仍要人跑 `/app/reconcile`。做成 CronJob 之前得先想清楚「谁批准退款」——自动退钱是无人值守的动账，和自动重放消息不是一个风险级别
 
-## 代码审查发现（2026-11-23，未修）
+## 代码审查与修复（2026-11-23 审查 / 同日修完）
 
-全量过了一遍 `backend/`、`payment-service/`、`fulfillment-service/`。编译、`go vet`、`gofmt` 都干净，下面这些**编译器发现不了**。完整说明见 Obsidian `19 代码审查`。
+全量过了一遍 `backend/`、`payment-service/`、`fulfillment-service/`。编译、`go vet`、`gofmt` 一直干净，下面这些是**编译器发现不了**的。逐条行号在 Obsidian `19 代码审查`，修法与验收在 `20 修复清单`。
 
-**会让钱或告警失真的四处**（P0）：
+| # | 问题 | 不修会怎样 | 修法 |
+|---|---|---|---|
+| P0-1 | outbox 毒消息永久悬空 | 失败 20 次后既不发送也不标记 → `ShopOutboxStuckByAge` **永久 critical**，整套告警失去可信度 | 迁移加 `dead_at`/`last_error`；relay 把「attempts 用尽且挂了 5 分钟」的标死；新增 `shop_outbox_dead` + `ShopOutboxDead` |
+| P0-2 | `cancel()` 失败仍 ack | DB 抖一下 = 订单停 CREATED + 库存不回补 + 消息消失，对账还看不见 | `cancel` 返回 error，失败 `Nack(true)`；耗尽重试改成**先补偿后进 DLQ** |
+| P0-3 | 对账漏掉「从未扣款」 | outbox 没投、DLQ 没人捞、扣款前崩溃，全都不可见 | 第五类 `stuck_unpaid`：`LEFT JOIN ... IS NULL` 单独查，再与四类 UNION ALL |
+| P0-4 | 金额不一致不校验 | 用户按旧价被扣、订单按新价标 PAID | `AmountMismatchError`；worker 走 `halt`（进 DLQ、**不取消**），对账归到 `amount_mismatch` |
+| P1-5 | 所有 4xx 都当拒付 | 422（我们的 bug）/429（限流）都会**取消订单**，拿用户背锅 | 408/429/5xx 可重试；其余 4xx 是 `RequestRejectedError` → 进 DLQ 不取消 |
+| P1-6 | 履约重试没有退避 | 两条消费链路节奏不同，`order.paid` 整 10 秒一次 | per-message `expiration`：`2s → 4s` 带抖动，封顶队列 TTL |
+| P1-7 | 履约 publish 无 confirm | broker 在窗口内崩溃 → 发货单永久丢失 | `createConfirmChannel` + 等确认后再 ack 原消息 |
+| P1-8 | 履约毒消息直接 ack | 与 Go 侧不一致，故障在 Node 侧静默消失 | 原样进 DLQ，`attempts` 顶到上限 |
+| 隐患 | 迁移用会话级 advisory lock | 连接回池后锁仍被持有，另一个实例永远等锁 | `pg_advisory_xact_lock` + 全部迁移放一个事务 |
+| 隐患 | 集群 `DEV_MODE=true` | 任何人都能 `?type=panic` 把 api Pod 打挂 | fault 端点额外要求 `X-Internal-Token`（不配密钥则端点不存在） |
+| 隐患 | 订单列表排序用不上索引 | `ORDER BY id DESC` 走不了 `(user_id, created_at DESC)` | 改 `ORDER BY created_at DESC, id DESC` |
+| 工程债 | 全仓零测试 | 改一个退避系数没人能发现 | 4 组表驱动测试：退避区间/抖动/封顶、支付六种响应分类、消息头类型、迁移语句切分 |
 
-1. **outbox 毒消息永久悬空，并让年龄告警永久 firing** —— `FetchOutbox` 只取 `attempts < 20`，但 `CountOutboxPending` / `OldestOutboxAge` 不看 attempts。失败 20 次之后这条消息既不发送、也不标记，`shop_outbox_pending` 卡住不降、`shop_outbox_oldest_seconds` 单调增长 → `ShopOutboxStuckByAge` 永久 critical。**告警永久响等于没有告警**，这条会连带毁掉整套告警的可信度
-2. **`cancel()` 失败时消息仍被 ack** —— `reschedule` 里 `cancel(...)` 之后无条件 `msg.Ack()`，而 `cancel` 内部失败只记一行日志。DB 抖一下就是「订单停在 CREATED + 库存不回补 + 消息消失」，且对账也看不见（没有 payments 行）
-3. **对账有盲区：从未扣款的卡死订单完全不可见** —— `mismatchSelect` 用的是 `JOIN payments`，没有 payments 行的订单整个不在视野里。outbox 没投出去、消息卡在 DLQ、worker 扣款前就崩了，这三种都产生「CREATED + 库存已扣 + 钱没动」，而四类 kind 一个都不匹配
-4. **支付金额不一致时不校验** —— 网关幂等返回的是**第一次**的金额，而 `Charge` 只检查 `status`，从不比对 `AmountCents`。价格在两次读写之间变化时，用户按旧价被扣、订单按新价标 PAID，要等 15s 后的对账才发现
-
-**语义不一致的五处**（P1）：
-
-5. payment 把所有 4xx 都归成 `DeclinedError` → 422（金额超限，是我们自己的 bug）和 429（限流，等一会儿就好）都会触发**取消订单**。只有「网关明确判定失败」才是拒付
-6. 履约链路的重试**没有退避**：`order.paid` 侧只靠队列级 `x-message-ttl: 10s`，而 `order.created` 侧已经是 `2s → 4s` × `[0.5,1.5)`。同一套架构两条链路行为不同
-7. 履约的 publish **没有 publisher confirm**（用的是 `createChannel` 而不是 `createConfirmChannel`），`publish` 之后立刻 `ack` 原消息 → broker 在窗口内崩溃时发货单永久消失。Go 侧是 `Confirm(false)` + `WaitContext`，两边标准不一样
-8. 履约侧毒消息**直接 ack 丢弃**，而 Go 侧已经改成「解不开也进 DLQ 留证据」。同一条原则两个实现
-
-**其余八条隐患**（匿名订单可枚举、集群 `DEV_MODE=true`、`ListOrdersByUser` 的排序用不上索引、`/api/stats` 重复现场查询、broker 发布持锁等 confirm、replay dry-run 可能重复、advisory lock 还池、网关金额上限与订单金额脱钩）和 **一个零测试的工程债**，都在 `19 代码审查` 里带行号列着。
-
-刻意**没有**在本轮修改：代码将被 lock，且这批问题需要按依赖顺序改（告警可信度 → 补偿正确性 → 金额校验 → 对账补类 → 履约三件一起）。
-
-- **对账扫描用不上现有索引**：`orders_status_idx` 是 `(status, updated_at DESC)`，但对账的四个分类是 `OR` 出来的，没有 `status` 的等值条件，所以只能全表扫（几十万单以内仍是毫秒级）。真要上量应加一条部分索引：`(updated_at) where status in ('CREATED','CANCELLED')`
+**仍然没做**（都在「已知限制」里）：`/api/stats` 每次现场 `QueueInspect ×6`（与 15s 采样重复）、broker 发布持 `mutex` 等 confirm（amqp channel 本身不并发安全，要改得换连接池）、匿名订单可枚举（要改产品契约，加 `public_token` 而不是靠 id）、replay dry-run 可能重复读、网关金额上限与订单金额脱钩。
 
 ## Docker Hub 不可达时怎么出镜像
 
