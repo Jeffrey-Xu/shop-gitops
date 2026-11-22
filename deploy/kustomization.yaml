@@ -20,19 +20,19 @@ images:
   # 内容等价于 backend 主干 + payment 客户端接线。
   # fulfill1 = 加了 account 二进制的那一版（同样走本地交叉编译打包）。
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: 5e444838a1112a1dd7ffbea51eb0f8ca50ab670e
+    newTag: f88395df007dfee17feb41bf0469a7f8d8c319cd
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: 5e444838a1112a1dd7ffbea51eb0f8ca50ab670e
+    newTag: f88395df007dfee17feb41bf0469a7f8d8c319cd
   # 支付服务是 Python。以前它的镜像是本地 docker build 出来的（local1 / local2），
   # CI 根本不重建 —— 后果是「repo 里改了 payment-service，集群还跑旧代码」。
   # 加退款端点时就踩在这上面：不把 payment 放进 CI，集群的 Pod 永远 404。
   # 现在它已在 CI 矩阵里，tag 由 bump 改成 sha；下面的 local2 只是 bootstrap 值，
   # 仅用于「第一次带 payment 的 CI 还没跑完」这段窗口。
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
-    newTag: 5e444838a1112a1dd7ffbea51eb0f8ca50ab670e
+    newTag: f88395df007dfee17feb41bf0469a7f8d8c319cd
   # 履约服务是 Node，镜像单独构建
   - name: ghcr.io/jeffrey-xu/shop-gitops/fulfillment
-    newTag: 5e444838a1112a1dd7ffbea51eb0f8ca50ab670e
+    newTag: f88395df007dfee17feb41bf0469a7f8d8c319cd
 labels:
   - pairs:
       app.kubernetes.io/managed-by: argocd
