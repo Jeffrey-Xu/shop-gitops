@@ -256,14 +256,14 @@
       "id": 6,
       "type": "timeseries",
       "title": "队列深度 / outbox 积压",
-      "description": "两个 Gauge 由 api 主循环每 15s 采样一次",
+      "description": "api 每 15s 采样一次。DLQ 一旦非 0 就意味着有订单走到「放弃重试」，对应告警 ShopDlqNotEmpty。",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 12,
         "y": 8
       },
@@ -286,13 +286,79 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "shop_queue_depth",
-          "legendFormat": "队列积压"
+          "expr": "shop_queue_messages{queue=\"shop.order.created\"}",
+          "legendFormat": "主队列"
         },
         {
           "refId": "B",
+          "expr": "shop_queue_messages{queue=~\".+\\.retry\"}",
+          "legendFormat": "重试中 {{queue}}"
+        },
+        {
+          "refId": "C",
+          "expr": "shop_queue_messages{queue=~\".+\\.dlq\"}",
+          "legendFormat": "死信 {{queue}}"
+        },
+        {
+          "refId": "D",
           "expr": "shop_outbox_pending",
           "legendFormat": "outbox 未投递"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "outbox 最老一条",
+      "description": "最老一条未投递消息的年龄。relay 健康时是秒级；>60s 触发 ShopOutboxStuckByAge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 20,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "shop_outbox_oldest_seconds",
+          "legendFormat": "最老一条"
         }
       ]
     },
