@@ -1,4 +1,8 @@
-FROM golang:1.24-alpine AS build
+# 构建镜像必须跟 go.mod 的 go 指令对齐：golang 官方镜像默认 GOTOOLCHAIN=local，
+# 版本低了不会自动切工具链，而是直接报 "go.mod requires go >= 1.26.0"。
+# 这次是被 golang.org/x/crypto v0.57 抬上去的（钉回 1.24 要连带降 x/crypto、
+# grpc-gateway、genproto 一串，不如直接把构建镜像跟上）。
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
