@@ -18,6 +18,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/obs"
 )
 
 // Result 是网关的响应体。
@@ -58,8 +62,18 @@ func New(baseURL string, timeout time.Duration, log *slog.Logger) *Client {
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		hc:      &http.Client{Timeout: timeout},
-		log:     log,
+		// otelhttp 的 Transport 干两件事：开 client span、把 traceparent 写进请求头。
+		// 手写第一步很容易、漏掉第二步也很容易 —— 而漏了第二条，调用照样成功，
+		// 只是 trace 在支付网关这一跳断掉，而且要到排障时才会发现。
+		hc: &http.Client{
+			Timeout: timeout,
+			Transport: otelhttp.NewTransport(http.DefaultTransport,
+				otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+					return r.Method + " " + r.URL.Path
+				}),
+			),
+		},
+		log: log,
 	}
 }
 
@@ -123,6 +137,7 @@ func (c *Client) Charge(ctx context.Context, orderID string, amountCents int64) 
 		"amount_cents", res.AmountCents,
 		"replayed", res.Replayed,
 		"dur_ms", time.Since(start).Milliseconds(),
+		"trace_id", obs.TraceID(ctx),
 	)
 
 	if res.Status != "succeeded" {

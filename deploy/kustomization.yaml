@@ -23,9 +23,12 @@ images:
     newTag: 8c0961926a440c49c83fc3ddd05a974267bf2fbe
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
     newTag: 8c0961926a440c49c83fc3ddd05a974267bf2fbe
-  # 支付服务是 Python，镜像单独构建；本地用 Docker 直接 build 出 local1 这个 tag
+  # 支付服务是 Python，不在 CI 矩阵里（见 ci.yaml 的说明），镜像是本地 docker build 出来的。
+  # local2 = 加了 OTel 埋点（FastAPI 自动埋点 + OTLP 导出）的那一版。
+  # 改动 payment-service/ 之后必须重新 build 并改这里的 tag —— CI 不会帮你做这件事，
+  # 这正是本地镜像和服务代码容易悄悄脱节的地方。
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
-    newTag: local1
+    newTag: local2
   # 履约服务是 Node，镜像单独构建
   - name: ghcr.io/jeffrey-xu/shop-gitops/fulfillment
     newTag: 8c0961926a440c49c83fc3ddd05a974267bf2fbe

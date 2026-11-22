@@ -1,4 +1,5 @@
 import amqp from 'amqplib';
+import { context, propagation, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 import { config } from './config.js';
 import { logger } from './log.js';
 import { consumerUp, shipmentsCreated } from './metrics.js';
@@ -6,6 +7,10 @@ import { createShipment } from './db.js';
 import { pickCarrier, trackingNumber } from './carrier.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// getTracer 在 provider 就绪前调用也没关系：api 包里的 tracer 是个代理，
+// 真正 startSpan 时才解析到全局 provider。
+const tracer = trace.getTracer('shop-fulfillment');
 
 /**
  * order.paid 的消费者。
@@ -105,27 +110,60 @@ export class OrderPaidConsumer {
     if (!msg) return;
     const attempts = Number(msg.properties.headers?.attempts ?? 0);
 
-    let event;
-    try {
-      event = JSON.parse(msg.content.toString());
-    } catch (err) {
-      // 解不开的消息重试一万次也解不开，直接 ACK 丢弃。
-      // 真实项目应该落到一张 poison_messages 表里留证据。
-      logger.error({ err: err.message, raw: msg.content.toString().slice(0, 200) }, 'bad_event_payload');
-      this.#ack(msg);
-      return;
-    }
+    // 从消息头还原上游 context（traceparent 由 Go 的 broker 注入）。
+    // extract 在拿不到头时返回原 ctx，所以手工投的测试消息也能正常跑，
+    // 只是它自己会成为一条新 trace 的起点。
+    const parent = propagation.extract(context.active(), msg.properties.headers ?? {});
+    const span = tracer.startSpan(
+      `consume ${config.queue}`,
+      {
+        kind: SpanKind.CONSUMER,
+        attributes: {
+          'messaging.system': 'rabbitmq',
+          'messaging.operation': 'process',
+          'messaging.destination.name': config.queue,
+          'messaging.message.receive_attempt': attempts + 1,
+        },
+      },
+      parent,
+    );
 
-    const orderId = event.orderId;
     try {
-      await handler(event, attempts);
-      this.#ack(msg);
-    } catch (err) {
-      logger.error(
-        { orderId, attempt: attempts + 1, err: err.message },
-        'fulfill_failed',
-      );
-      await this.#retryOrDrop(msg, event, attempts, err);
+      let event;
+      try {
+        event = JSON.parse(msg.content.toString());
+      } catch (err) {
+        // 解不开的消息重试一万次也解不开，直接 ACK 丢弃。
+        // 真实项目应该落到一张 poison_messages 表里留证据。
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'bad_event_payload' });
+        logger.error({ err: err.message, raw: msg.content.toString().slice(0, 200) }, 'bad_event_payload');
+        this.#ack(msg);
+        return;
+      }
+
+      const orderId = event.orderId;
+      // 订单号挂在 span 上：Tempo 里能按订单号搜，排障时手上通常只有订单号
+      span.setAttribute('order.id', Number(orderId) || 0);
+
+      // context.with 让 handler 内部（包括 await 之后）都看得到这个 span，
+      // 这样 undici 的自动埋点才会把回写 api 的 fetch span 挂到它下面。
+      // 不包这一层，fetch 的 span 会变成没有父节点的孤儿。
+      await context.with(trace.setSpan(parent, span), async () => {
+        try {
+          await handler(event, attempts);
+          this.#ack(msg);
+        } catch (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+          logger.error(
+            { orderId, attempt: attempts + 1, err: err.message },
+            'fulfill_failed',
+          );
+          await this.#retryOrDrop(msg, event, attempts, err);
+        }
+      });
+    } finally {
+      span.end();
     }
   }
 
@@ -147,6 +185,10 @@ export class OrderPaidConsumer {
       attempts: next,
       last_error: String(err.message ?? err).slice(0, 500),
     };
+    // 重试消息也要带 traceparent。不带的话，第一次失败之后的链路全断，
+    // 而排查失败订单最需要的恰恰是「重试那几次到底怎么了」。
+    // 注入后重试的 consume 会挂在本次 consume 下面，一条 trace 看全四次尝试。
+    propagation.inject(context.active(), headers);
 
     const target =
       next >= config.maxAttempts

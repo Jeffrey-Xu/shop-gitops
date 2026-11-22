@@ -119,6 +119,10 @@ spec:
                     request_id = "request_id",
                     order_id   = "order_id",
                     service    = "service",
+                    // trace_id 放进 structured metadata 而不是 label：
+                    // 每条 trace 都是新值，做成 label 会让索引基数爆掉。
+                    // 放这里既能等值过滤（{trace_id="..."}），又不建索引。
+                    trace_id   = "trace_id",
                   }
                 }
 

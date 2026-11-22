@@ -37,12 +37,21 @@ spec:
               containerPort: 8080
           env:
             - name: APP_VERSION
-              value: "v4-fulfillment"
+              value: "v5-tracing"
             - name: LOG_LEVEL
               valueFrom:
                 configMapKeyRef:
                   name: shop-config
                   key: LOG_LEVEL
+            # 链路追踪。endpoint 指向 monitoring 的 Tempo；
+            # 从 ConfigMap 取而不是写死在这里，改一处所有服务一起生效
+            - name: OTEL_SERVICE_NAME
+              value: "fulfillment"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: shop-config
+                  key: OTEL_EXPORTER_OTLP_ENDPOINT
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

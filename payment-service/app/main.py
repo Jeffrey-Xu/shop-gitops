@@ -27,6 +27,12 @@ from contextlib import asynccontextmanager
 import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
@@ -48,6 +54,11 @@ class JsonFormatter(logging.Formatter):
             "version": VERSION,
             "logger": record.name,
         }
+        # 把 trace_id 写进每条日志：Loki 里点一行就能跳到 Tempo 的对应链路。
+        # 没有活跃 span 时不写空串，否则按 trace_id 过滤会混进无关的行。
+        span_context = trace.get_current_span().get_span_context()
+        if span_context.is_valid:
+            payload["trace_id"] = format(span_context.trace_id, "032x")
         for key, value in getattr(record, "extra_fields", {}).items():
             payload[key] = value
         if record.exc_info:
@@ -68,6 +79,49 @@ def setup_logging() -> logging.Logger:
 
 
 log = setup_logging()
+
+
+# --------------------------------------------------------------------------
+# 链路追踪
+#
+# 这一跳是整条链路里唯一的 Python：Go 侧 worker 用 otelhttp 发请求，
+# traceparent 就在请求头里；FastAPI 的埋点自动把它接上，
+# 所以这里不需要手写任何传播代码 —— 只要别把 EXCLUDED 路径写错。
+# --------------------------------------------------------------------------
+_tracer_provider: TracerProvider | None = None
+
+
+def setup_tracing() -> TracerProvider | None:
+    """没配 OTEL_EXPORTER_OTLP_ENDPOINT 就不启用，本地直接 uvicorn 跑不需要 Tempo。"""
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").rstrip("/")
+    if not endpoint:
+        log.warning(
+            "tracing_disabled",
+            extra={"extra_fields": {"reason": "OTEL_EXPORTER_OTLP_ENDPOINT 未设置"}},
+        )
+        return None
+
+    provider = TracerProvider(
+        resource=Resource.create(
+            {
+                "service.name": os.getenv("OTEL_SERVICE_NAME", SERVICE),
+                "service.version": VERSION,
+                "k8s.pod.name": os.getenv("HOSTNAME", ""),
+                "deployment.environment.name": os.getenv("APP_ENV", "local"),
+            }
+        )
+    )
+    # 2 秒一批而不是默认的 5 秒：扣完款要能马上在 Tempo 里看到。
+    # 等 5 秒会让人怀疑链路没接上，然后去查一堆本来没问题的地方。
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", timeout=5),
+            schedule_delay_millis=2000,
+        )
+    )
+    trace.set_tracer_provider(provider)
+    log.info("tracing_enabled", extra={"extra_fields": {"endpoint": endpoint}})
+    return provider
 
 
 # --------------------------------------------------------------------------
@@ -137,10 +191,21 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         pool.close()
+        # 最后 flush：batch 里攒着的就是退出前最后几笔扣款，丢掉等于扔了现场
+        if _tracer_provider is not None:
+            _tracer_provider.shutdown()
         log.info("service_stopped")
 
 
 app = FastAPI(title="shop payment service", version=VERSION, lifespan=lifespan)
+
+_tracer_provider = setup_tracing()
+if _tracer_provider is not None:
+    # 排除探针和 /metrics：kubelet 每 10s 探一次、Prometheus 每 15s 抓一次，
+    # 全采的话 trace 列表里几乎全是它们，真正要看的扣款链路会被埋掉。
+    FastAPIInstrumentor.instrument_app(
+        app, excluded_urls="/healthz,/readyz,/metrics"
+    )
 
 
 # --------------------------------------------------------------------------

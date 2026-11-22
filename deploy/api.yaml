@@ -24,7 +24,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shop
 data:
-  APP_VERSION: "v5-catalog"
+  APP_VERSION: "v6-tracing"
   LOG_LEVEL: "info"
   CACHE_TTL: "30s"
   # 打开后才注册 /api/dev/fault（演示错误率和日志链路用）
@@ -39,6 +39,14 @@ data:
   # JWT 的签发方与有效期。account 和 api 必须用同一个 issuer，否则验签不过。
   JWT_ISSUER: "shop"
   JWT_TTL: "24h"
+  # ---- 链路追踪 ----
+  # 指向 monitoring 命名空间的 Tempo（OTLP/HTTP 4318）。
+  # 留空的话服务保持 noop：本地只起 api+worker 不启 Tempo 也能跑，且不会刷导出失败。
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://tempo.monitoring.svc.cluster.local:4318"
+  # 采样率。本地全采 —— 演示时不能出现「这单刚好没被采到」，
+  # 那种「有时候有有时候没有」最容易被误判成链路没接通。
+  OTEL_TRACES_SAMPLER_ARG: "1.0"
+  APP_ENV: "local"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -79,6 +87,10 @@ spec:
                 name: shop-config
           env:
             # 连接串含口令，放 Secret；同名 env 优先级高于 envFrom
+            # 服务名进 span 的 service.name：Grafana 里按服务筛 trace 全靠它。
+            # 三个 Go 服务同一个镜像，这里必须按 Deployment 分开给。
+            - name: OTEL_SERVICE_NAME
+              value: "api"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

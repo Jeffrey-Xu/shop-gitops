@@ -37,7 +37,15 @@ func Run(ctx context.Context, log *slog.Logger, st *store.Store, brk *broker.Bro
 		}
 
 		for _, m := range msgs {
-			if err := brk.Publish(ctx, m.Topic, m.Payload, nil); err != nil {
+			// 每条消息从库里的 traceparent 起一条支线。
+			// 用进程 ctx 直接发的话，publish span 会另起一条 trace，
+			// 「下单」和「下单之后发生了什么」就永远对不上了。
+			// 套一层超时而不是裸 Background：relay 卡住时要能自己放弃，
+			// 不能因为一条消息发不出去就把整个投递循环钉死。
+			pctx, cancel := context.WithTimeout(obs.ContextFromTraceparent(m.Traceparent), 10*time.Second)
+			err := brk.Publish(pctx, m.Topic, m.Payload, nil)
+			cancel()
+			if err != nil {
 				obs.OutboxPublished.WithLabelValues("error").Inc()
 				log.Error("outbox_publish_failed", "outbox_id", m.ID, "topic", m.Topic, "attempts", m.Attempts+1, "err", err)
 				if e := st.MarkOutboxFailed(ctx, m.ID); e != nil {

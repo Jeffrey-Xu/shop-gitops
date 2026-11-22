@@ -1,4 +1,5 @@
 import pino from 'pino';
+import { context, trace } from '@opentelemetry/api';
 import { config } from './config.js';
 
 // 输出字段刻意和 Go 侧 slog 对齐：level / msg / service / version。
@@ -11,9 +12,14 @@ export const logger = pino({
   formatters: {
     level: (label) => ({ level: label }),
   },
-  // pod 名字放进每条日志，Loki 里能区分副本
+  // pod 名字放进每条日志，Loki 里能区分副本；
+  // trace_id 一起带上，这样在 Loki 里点一行就能跳到 Tempo 里对应的那条链路。
+  // 没有活跃 span 时（启动阶段、定时器）不写空字符串 —— 空值会污染按 trace_id 的过滤。
   mixin() {
-    return process.env.HOSTNAME ? { pod: process.env.HOSTNAME } : {};
+    const fields = process.env.HOSTNAME ? { pod: process.env.HOSTNAME } : {};
+    const sc = trace.getSpan(context.active())?.spanContext();
+    if (sc?.traceId) fields.trace_id = sc.traceId;
+    return fields;
   },
 });
 

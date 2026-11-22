@@ -45,6 +45,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := obs.InitTracing(ctx, "account", cfg.Version)
+	if err != nil {
+		log.Error("tracing_init_failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(sctx)
+	}()
+
 	st, err := store.Open(ctx, cfg.DatabaseURL, log)
 	if err != nil {
 		log.Error("database_open_failed", "err", err)

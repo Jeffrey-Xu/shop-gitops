@@ -8,6 +8,8 @@ import (
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/obs"
 )
 
 // CreateOrder 是整个写路径的核心：
@@ -124,8 +126,11 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 	if err != nil {
 		return Order{}, false, err
 	}
+	// traceparent 一起入库：relay 是定时器驱动的，下单的 span 到那时早就结束了，
+	// 只有落库这一个办法能把链路接过去。
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO outbox (topic, payload) VALUES ('order.created', $1)`, payload); err != nil {
+		`INSERT INTO outbox (topic, payload, traceparent) VALUES ('order.created', $1, $2)`,
+		payload, obs.Traceparent(ctx)); err != nil {
 		return Order{}, false, err
 	}
 
@@ -373,7 +378,8 @@ func (s *Store) MarkOrderPaid(ctx context.Context, id int64, note, paymentID str
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO outbox (topic, payload) VALUES ('order.paid', $1)`, payload); err != nil {
+		`INSERT INTO outbox (topic, payload, traceparent) VALUES ('order.paid', $1, $2)`,
+		payload, obs.Traceparent(ctx)); err != nil {
 		return false, err
 	}
 

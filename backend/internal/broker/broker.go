@@ -20,6 +20,12 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/obs"
 )
 
 const (
@@ -192,11 +198,34 @@ func (b *Broker) Publish(ctx context.Context, routingKey string, body []byte, he
 }
 
 func (b *Broker) PublishTo(ctx context.Context, exchange, routingKey string, body []byte, headers amqp.Table) error {
+	// MQ 不是 HTTP：没有任何人帮我们传 traceparent。这一跳必须自己注入，
+	// 否则链路在第一次跨进程时就断，而且断得无声无息（图上只是少一截）。
+	ctx, span := obs.Tracer().Start(ctx, "publish "+routingKey,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "rabbitmq"),
+			attribute.String("messaging.operation", "publish"),
+			attribute.String("messaging.destination.name", exchange),
+			attribute.String("messaging.rabbitmq.routing_key", routingKey),
+		))
+	defer span.End()
+
+	fail := func(err error) error {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	if headers == nil {
+		headers = amqp.Table{}
+	}
+	otel.GetTextMapPropagator().Inject(ctx, amqpCarrier(headers))
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.pub == nil || b.pub.IsClosed() {
-		return errors.New("publish channel closed")
+		return fail(errors.New("publish channel closed"))
 	}
 	dc, err := b.pub.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
@@ -206,14 +235,14 @@ func (b *Broker) PublishTo(ctx context.Context, exchange, routingKey string, bod
 		Headers:      headers,
 	})
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	ack, err := dc.WaitContext(ctx)
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	if !ack {
-		return errors.New("broker nacked the message")
+		return fail(errors.New("broker nacked the message"))
 	}
 	return nil
 }
@@ -252,9 +281,26 @@ func (b *Broker) Consume(ctx context.Context, queue string, prefetch int, handle
 					return ch.Nack(d.DeliveryTag, false, requeue)
 				},
 			}
-			if err := handle(ctx, msg); err != nil {
+			// 从消息头还原上游 context。基底用进程 ctx 而不是 Background：
+			// 收到 SIGTERM 时要能中断正在处理的消息，否则优雅退出会卡住。
+			mctx, span := obs.Tracer().Start(
+				otel.GetTextMapPropagator().Extract(ctx, amqpCarrier(d.Headers)),
+				"consume "+queue,
+				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithAttributes(
+					attribute.String("messaging.system", "rabbitmq"),
+					attribute.String("messaging.operation", "process"),
+					attribute.String("messaging.destination.name", queue),
+				))
+			if err := handle(mctx, msg); err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				b.log.Error("handler_failed", "queue", queue, "err", err)
 			}
+			// 处理完立刻结束。重试是「再投一条新消息」，它会带着新的 traceparent
+			// 重新进来，所以每次重试都挂在上一段的下面 —— 一条 trace 里能看全
+			// 三次失败加一次成功，而不用按时间戳去猜哪几条日志属于同一次重试。
+			span.End()
 		}
 	}
 }
@@ -270,4 +316,32 @@ func (b *Broker) QueueDepth(queue string) (int, error) {
 		return 0, err
 	}
 	return q.Messages, nil
+}
+
+// amqpCarrier 让 amqp.Table 能当 W3C 传播载体用。
+//
+// 不能直接用 amqp.Table：TextMapCarrier 的接口是 string→string，
+// 而表里的值还混着 int32（attempts）和真正的字符串（last_error）。
+// Get/Set 只碰字符串，其余原样留着 —— 遍历时也不能把它们当成 trace 头。
+type amqpCarrier amqp.Table
+
+func (c amqpCarrier) Get(key string) string {
+	if v, ok := c[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (c amqpCarrier) Set(key, value string) {
+	c[key] = value
+}
+
+func (c amqpCarrier) Keys() []string {
+	out := make([]string, 0, len(c))
+	for k, v := range c {
+		if _, ok := v.(string); ok {
+			out = append(out, k)
+		}
+	}
+	return out
 }

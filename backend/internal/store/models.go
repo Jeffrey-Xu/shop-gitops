@@ -142,4 +142,7 @@ type OutboxMessage struct {
 	Topic    string
 	Payload  []byte
 	Attempts int
+	// Traceparent 是写这行时的 W3C 头。relay 发布时靠它把新 span
+	// 挂回下单那一条 trace 上，否则链路在这里断成两截。
+	Traceparent string
 }

@@ -36,6 +36,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// 在装配任何客户端之前初始化：Tracer 取的是全局 provider，
+	// 先建好才能保证 outbox relay、broker、payment client 都拿到真的 tracer。
+	shutdownTracing, err := obs.InitTracing(ctx, "api", cfg.Version)
+	if err != nil {
+		log.Error("tracing_init_failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		// 用 Background 加超时，而不是已经取消的 ctx：
+		// 收到 SIGTERM 时 ctx 已经 done，拿它去 shutdown 会一帧都发不出去。
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(sctx)
+	}()
+
 	st, err := store.Open(ctx, cfg.DatabaseURL, log)
 	if err != nil {
 		log.Error("database_open_failed", "err", err)

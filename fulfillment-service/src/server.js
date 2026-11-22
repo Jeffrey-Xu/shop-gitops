@@ -1,3 +1,6 @@
+// 必须是第一条 import：自动埋点在模块加载时打补丁，
+// 晚于 fastify / undici / pg 加载就补不上了（且不报错，只是链路缺点东西）。
+import './tracing.js';
 import Fastify from 'fastify';
 import { config, validateConfig } from './config.js';
 import { logger } from './log.js';
@@ -5,6 +8,7 @@ import { registry } from './metrics.js';
 import { initDb, findShipment, listShipments, pool } from './db.js';
 import { OrderPaidConsumer, handleOrderPaid } from './consumer.js';
 import { startDispatcher, advanceOne } from './dispatcher.js';
+import { shutdownTracing } from './tracing.js';
 
 const app = Fastify({
   loggerInstance: logger,
@@ -137,6 +141,9 @@ async function main() {
     await app.close().catch(() => {});
     await consumer.stop().catch(() => {});
     await pool.end().catch(() => {});
+    // 最后 flush span：batch 里攒着的那些就是这次退出前最后发生的事，
+    // 丢掉它们等于把最关键的现场扔了
+    await shutdownTracing();
     logger.info({}, 'service_stopped');
     process.exit(0);
   };

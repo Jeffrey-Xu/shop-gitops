@@ -1,0 +1,74 @@
+# 链路：单机模式（一个 StatefulSet 跑全部 target），filesystem 存储，不接对象存储。
+# 和 Loki 的取舍一致：本地只需要「能查最近一天的 trace」，S3/MinIO 那一套是额外运维。
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tempo
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: tempo
+    targetRevision: 1.24.4
+    helm:
+      valuesObject:
+        tempo:
+          # 默认 1024MB 的 Go ballast —— 在只有 8G 的本地节点上是纯浪费。
+          # 留着一点点（64MB）减少 GC 抖动即可，别按生产规格配。
+          memBallastSizeMbs: 64
+          # 不向 Grafana Labs 上报用量
+          reportingEnabled: false
+          # 保留 24h，和 Loki 7 天、Prometheus 的窗口错开：
+          # trace 是「查一次就够」的数据，不需要长期留着
+          retention: 24h
+          storage:
+            trace:
+              backend: local
+              local:
+                path: /var/tempo/traces
+              wal:
+                path: /var/tempo/wal
+          receivers:
+            # 显式写 otlp，是因为要确认 4317/4318 一定开着（应用只认这两个口）。
+            # 注意 Helm 是深度合并：jaeger / zipkin 的默认 receiver
+            # 仍然会在，这里写的不是「只开 OTLP」。要真关掉得把对应 key 置 null，
+            # 而 _ports.tpl 对 null 会直接报错，不值得为省四个端口去试。
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+                http:
+                  endpoint: 0.0.0.0:4318
+          resources:
+            requests:
+              cpu: 50m
+              memory: 200Mi
+            limits:
+              # 单机 Tempo 的常驻内存在 200-400MB 之间；
+              # limit 给 700Mi 是留出查询时的峰值，超了宁可 OOM 重启也不要拖垮节点
+              memory: 700Mi
+
+        # headless 之外的那个 ClusterIP Service，名字就是 tempo，
+        # 所以应用侧直接写 http://tempo.monitoring.svc.cluster.local:4318
+        persistence:
+          enabled: true
+          size: 5Gi
+          storageClassName: standard
+
+        # Tempo 自己的指标（收到的 span 数、丢弃数、查询延迟）进 Prometheus。
+        # 没有这个，「trace 查不到」就只能猜是应用没发还是 Tempo 没存。
+        serviceMonitor:
+          enabled: true
+          interval: 30s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

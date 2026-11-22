@@ -11,6 +11,8 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/broker"
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/cache"
@@ -44,7 +46,14 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	}
 
 	attempts := headerInt(msg.Headers, "attempts")
-	log := w.Log.With("order_id", ev.OrderID, "attempt", attempts+1, "product_id", ev.ProductID)
+	// 把订单号挂到消费 span 上。Tempo 里就能按 order.id 搜到这一单，
+	// 不用先知道 trace id 才能查 —— 排障时手上永远只有订单号。
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.Int64("order.id", ev.OrderID),
+		attribute.Int("order.attempt", attempts+1),
+	)
+	// trace_id 进日志：Loki 里点一行就能跳到对应的 trace
+	log := w.Log.With("order_id", ev.OrderID, "attempt", attempts+1, "product_id", ev.ProductID, "trace_id", obs.TraceID(ctx))
 
 	// 幂等闸门 1：订单状态。重复投递时这里直接短路。
 	status, err := w.Store.GetOrderStatus(ctx, ev.OrderID)

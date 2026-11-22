@@ -120,15 +120,49 @@ spec:
             hosts:
               - grafana.localhost
             path: /
-          # Loki 后装也行，datasource 指向不存在的服务不会让 Grafana 起不来
+          # Loki / Tempo 后装也行：datasource 指向不存在的服务不会让 Grafana 起不来
+          #
+          # uid 显式写死。Tempo 的 tracesToLogs 和 Loki 的 derivedFields 互相按 uid 引用，
+          # 不写的话就是随机串 —— 改一次随机值，两个方向的跳转同时断掉，而且不报错。
           additionalDataSources:
             - name: Loki
+              uid: loki
               type: loki
               url: http://loki-gateway.monitoring.svc.cluster.local
               access: proxy
               isDefault: false
               jsonData:
                 maxLines: 1000
+                # 日志 → 链路：日志行里有 "trace_id":"<32位十六进制>"，
+                # 点一下直接跳到 Tempo 的同一条 trace。
+                # 必须写 $$。Grafana 读 provisioning 文件时会把 $ 当环境变量插值，
+                # 写成单个 ${__value.raw} 会查不到这个环境变量、被替换成空串
+                # （链接点开是空的，且不报错）；$$ 才会落成真正的单个 $。已实测。
+                derivedFields:
+                  - name: TraceID
+                    matcherRegex: '"trace_id":"([0-9a-f]{32})"'
+                    url: '$${__value.raw}'
+                    datasourceUid: tempo
+                    urlDisplayLabel: 查看链路
+            - name: Tempo
+              uid: tempo
+              type: tempo
+              url: http://tempo.monitoring.svc.cluster.local:3200
+              access: proxy
+              isDefault: false
+              jsonData:
+                # trace → 日志：在 trace 面板上按 trace_id 拉出这一段的所有日志。
+                # 用 namespace 而不是 service 过滤：一单会跨 5 个服务，
+                # 恰恰是「同时看这 5 个服务的日志」才有用。
+                tracesToLogsV2:
+                  datasourceUid: loki
+                  spanStartTimeShift: '-1m'
+                  spanEndTimeShift: '1m'
+                  filterByTraceID: false
+                  customQuery: true
+                  query: '{namespace="shop"} |= "$${__span.traceId}"'
+                # 不配 serviceMap：它依赖 Tempo 的 metrics-generator 往 Prometheus
+                # 写 service graph 指标，本地没开。配了只会得到一个空面板加一个错。
 
         kube-state-metrics:
           replicas: 1

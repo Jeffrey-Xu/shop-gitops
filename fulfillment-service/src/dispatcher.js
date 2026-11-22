@@ -1,3 +1,4 @@
+import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 import { config } from './config.js';
 import { logger } from './log.js';
 import { advances, inFlight } from './metrics.js';
@@ -11,6 +12,8 @@ import {
 import { ORDER_STATUS, TRANSITIONS, stepNote } from './carrier.js';
 import { reportShipment } from './api-client.js';
 
+const tracer = trace.getTracer('shop-fulfillment');
+
 /**
  * 物流推进器。
  *
@@ -22,6 +25,35 @@ import { reportShipment } from './api-client.js';
 
 /** 处理一条发货单的下一档。返回推进后的行，没推进则返回 null。 */
 export async function advanceOne(shipment) {
+  // 定时器驱动的推进单独起一条 trace，不挂到支付那条上：
+  // 一单从支付到签收隔了几十秒到几天，塞进同一条 trace 会让它长得没法读，
+  // 也会把「下单链路耗时」这个指标毁掉。两条 trace 用 order.id 关联。
+  return tracer.startActiveSpan(
+    'fulfillment.advance',
+    {
+      kind: SpanKind.INTERNAL,
+      attributes: {
+        'order.id': Number(shipment.order_id) || 0,
+        'shipment.id': shipment.id,
+        'shipment.status.from': shipment.status,
+        'shipment.status.to': TRANSITIONS[shipment.status] ?? 'unknown',
+      },
+    },
+    async (span) => {
+      try {
+        return await advanceOnce(shipment);
+      } catch (err) {
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    },
+  );
+}
+
+async function advanceOnce(shipment) {
   const to = TRANSITIONS[shipment.status];
   if (!to) return null;
 

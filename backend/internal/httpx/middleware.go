@@ -11,6 +11,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/obs"
 )
@@ -61,10 +66,36 @@ func Wrap(log *slog.Logger, next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Request-ID", rid)
 
-		r2 := r.WithContext(context.WithValue(r.Context(), ridKey{}, rid))
+		// 探针和 /metrics 不建 span：kubelet 每 10s 探一次、Prometheus 每 15s 抓一次，
+		// 全采的话 Tempo 里绝大多数是这两类，真正要看的订单链路会被埋掉。
+		skipTrace := r.URL.Path == "/metrics" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz"
+
+		traceCtx := r.Context()
+		var span trace.Span
+		if !skipTrace {
+			// Extract 以 r.Context() 为基底：上游传来的 traceparent 会被接上，
+			// 同时这个 ctx 上的取消信号和已有的 value 都不会丢。
+			traceCtx = otel.GetTextMapPropagator().Extract(traceCtx, propagation.HeaderCarrier(r.Header))
+			traceCtx, span = obs.Tracer().Start(traceCtx, "http.request",
+				trace.WithSpanKind(trace.SpanKindServer),
+				trace.WithAttributes(
+					attribute.String("http.request.method", r.Method),
+					attribute.String("url.path", r.URL.Path),
+				),
+			)
+		}
+
+		ctx := context.WithValue(traceCtx, ridKey{}, rid)
+		r2 := r.WithContext(ctx)
 		// 必须用局部变量。直接 log = log.With(...) 会在闭包里累积，
 		// 每个请求再加一层 request_id，并发时还会互相踩（data race）。
-		reqLog := log.With("request_id", rid)
+		// trace_id 只在真的有 span 时才加：写个空字符串进 Loki，
+		// 按 trace_id 过滤时会混进一堆无关的行。
+		logArgs := []any{"request_id", rid}
+		if tid := obs.TraceID(ctx); tid != "" {
+			logArgs = append(logArgs, "trace_id", tid)
+		}
+		reqLog := log.With(logArgs...)
 
 		sw := &statusWriter{ResponseWriter: w}
 		defer func() {
@@ -89,6 +120,24 @@ func Wrap(log *slog.Logger, next http.Handler) http.Handler {
 				status = http.StatusOK
 			}
 			elapsed := time.Since(start)
+
+			if span != nil {
+				// 名字要等 ServeMux 匹配完才知道（r2.Pattern 是此刻才写好的），
+				// 所以先建 span、最后改名。否则 Tempo 里全是 "http.request"，
+				// 分不清是 /api/orders 还是 /api/products。
+				if route == "unmatched" {
+					span.SetName(r2.Method + " " + r2.URL.Path)
+				} else {
+					span.SetName(route)
+				}
+				span.SetAttributes(attribute.Int("http.response.status_code", status))
+				// 只把 5xx 标成错误。4xx 是调用方的问题（库存不足、未登录），
+				// 标红会让「错误率」这个信号失去意义。
+				if status >= 500 {
+					span.SetStatus(codes.Error, http.StatusText(status))
+				}
+				span.End()
+			}
 
 			obs.HTTPRequests.WithLabelValues(route, r2.Method, strconv.Itoa(status)).Inc()
 			obs.HTTPDuration.WithLabelValues(route, r2.Method).Observe(elapsed.Seconds())

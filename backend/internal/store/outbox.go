@@ -10,7 +10,7 @@ const OutboxMaxAttempts = 20
 // 否则两个 relay 会重复投递（虽然消费端幂等，但没必要浪费）。
 func (s *Store) FetchOutbox(ctx context.Context, limit int) ([]OutboxMessage, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, topic, payload, attempts
+		SELECT id, topic, payload, attempts, traceparent
 		  FROM outbox
 		 WHERE published_at IS NULL AND attempts < $1
 		 ORDER BY id
@@ -23,7 +23,7 @@ func (s *Store) FetchOutbox(ctx context.Context, limit int) ([]OutboxMessage, er
 	out := make([]OutboxMessage, 0, limit)
 	for rows.Next() {
 		var m OutboxMessage
-		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.Attempts); err != nil {
+		if err := rows.Scan(&m.ID, &m.Topic, &m.Payload, &m.Attempts, &m.Traceparent); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
