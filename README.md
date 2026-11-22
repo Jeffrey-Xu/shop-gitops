@@ -673,8 +673,8 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - ~~没有「我的订单」列表接口~~：已加 `GET /api/orders`，只按 token 里的 uid 查，明细和状态历史用两条 `= ANY($1)` 批量补齐，不做 N+1。仍然没有分页——订单多了要改游标，offset 会漏单
 - JWT 无法吊销：纯无状态，退出登录只是前端删 token。要立刻失效得上黑名单或 RS256 + 短 access + refresh
 - 前端 token 存 `localStorage`，XSS 可直接读走
-- 支付镜像是本地 `docker build` 的 `local2` tag，没走 CI；集群重置后要重新 build 并导入节点（`docker save | docker exec -i desktop-worker ctr -n k8s.io images import -`）
-- `backend:fulfill1` / `frontend:fulfill1` / `fulfillment:local1` 同样是本地镜像：Docker Hub 不可达时拉不到 `golang:1.24-alpine` 和 `nginx:1.27-alpine`，于是宿主机交叉编译后借现成镜像的运行层重新打包（见下文「Docker Hub 挂了怎么出镜像」）
+- ~~支付镜像是本地 `docker build` 的 `local2` tag，没走 CI~~：已修。`payment` 现在在 CI 矩阵里（`context: payment-service`），bump 的两处 `subst` 循环也带上了它，6 个服务的 tag 统一由 CI 写
+- `backend:fulfill1` / `frontend:fulfill1` / `fulfillment:local1` 仍是本地镜像的**历史残留**（只在 Docker Hub 不可达、CI 跑不出镜像时作为兜底）：那时拉不到 `golang:1.24-alpine` 和 `nginx:1.27-alpine`，只能宿主机交叉编译后借现成镜像的运行层重新打包（见下文「Docker Hub 挂了怎么出镜像」）
 - **同 tag 重建镜像后必须重新导入节点**：`imagePullPolicy: IfNotPresent` + containerd 里有同名 tag 的旧 manifest 时，`rollout restart` 用的还是旧镜像，症状是「代码明明改了却没生效」。要么换 tag，要么 `docker save | ctr import`
 - worker 调支付是**同步 HTTP**，3s 超时；支付服务慢会直接压到消费者的消费速率（prefetch=5 时最多 5 个并发卡在等）
 - Alloy 的 River 配置写 `#` 注释会**静默**失效（reload 报错但继续跑旧配置，ArgoCD 依旧 Synced/Healthy）；排查方式是看 alloy 日志里的 `failed to reload config`
@@ -687,6 +687,29 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - **对账只支持全额退款**：`refunds` 的主键是 `order_id`，一单只能退一次、退全额。部分退款要把主键改成 `(order_id, seq)`、按行分摊金额，而订单模型本身也得先支持「部分成交」——那是另一个量级的改动
 - **对账是直接读网关的库**：`payments` / `refunds` 和 `orders` 在同一个 PG 里，所以对账能一条 SQL JOIN 完。真实的第三方网关不会给你库，只能靠结算文件、对账 API 或 T+1 批处理，并且要按网关的账期切时间窗口。这个简化让「发现差异」很容易，但**发现差异的能力不该被这个巧合绑架**——换成真实网关时，`ScanMismatches` 里那条 SQL 就是第一个要重写的地方
 - **对账没有定时跑**：15s 采样只负责导出指标（发现），动手仍要人跑 `/app/reconcile`。做成 CronJob 之前得先想清楚「谁批准退款」——自动退钱是无人值守的动账，和自动重放消息不是一个风险级别
+
+## 代码审查发现（2026-11-23，未修）
+
+全量过了一遍 `backend/`、`payment-service/`、`fulfillment-service/`。编译、`go vet`、`gofmt` 都干净，下面这些**编译器发现不了**。完整说明见 Obsidian `19 代码审查`。
+
+**会让钱或告警失真的四处**（P0）：
+
+1. **outbox 毒消息永久悬空，并让年龄告警永久 firing** —— `FetchOutbox` 只取 `attempts < 20`，但 `CountOutboxPending` / `OldestOutboxAge` 不看 attempts。失败 20 次之后这条消息既不发送、也不标记，`shop_outbox_pending` 卡住不降、`shop_outbox_oldest_seconds` 单调增长 → `ShopOutboxStuckByAge` 永久 critical。**告警永久响等于没有告警**，这条会连带毁掉整套告警的可信度
+2. **`cancel()` 失败时消息仍被 ack** —— `reschedule` 里 `cancel(...)` 之后无条件 `msg.Ack()`，而 `cancel` 内部失败只记一行日志。DB 抖一下就是「订单停在 CREATED + 库存不回补 + 消息消失」，且对账也看不见（没有 payments 行）
+3. **对账有盲区：从未扣款的卡死订单完全不可见** —— `mismatchSelect` 用的是 `JOIN payments`，没有 payments 行的订单整个不在视野里。outbox 没投出去、消息卡在 DLQ、worker 扣款前就崩了，这三种都产生「CREATED + 库存已扣 + 钱没动」，而四类 kind 一个都不匹配
+4. **支付金额不一致时不校验** —— 网关幂等返回的是**第一次**的金额，而 `Charge` 只检查 `status`，从不比对 `AmountCents`。价格在两次读写之间变化时，用户按旧价被扣、订单按新价标 PAID，要等 15s 后的对账才发现
+
+**语义不一致的五处**（P1）：
+
+5. payment 把所有 4xx 都归成 `DeclinedError` → 422（金额超限，是我们自己的 bug）和 429（限流，等一会儿就好）都会触发**取消订单**。只有「网关明确判定失败」才是拒付
+6. 履约链路的重试**没有退避**：`order.paid` 侧只靠队列级 `x-message-ttl: 10s`，而 `order.created` 侧已经是 `2s → 4s` × `[0.5,1.5)`。同一套架构两条链路行为不同
+7. 履约的 publish **没有 publisher confirm**（用的是 `createChannel` 而不是 `createConfirmChannel`），`publish` 之后立刻 `ack` 原消息 → broker 在窗口内崩溃时发货单永久消失。Go 侧是 `Confirm(false)` + `WaitContext`，两边标准不一样
+8. 履约侧毒消息**直接 ack 丢弃**，而 Go 侧已经改成「解不开也进 DLQ 留证据」。同一条原则两个实现
+
+**其余八条隐患**（匿名订单可枚举、集群 `DEV_MODE=true`、`ListOrdersByUser` 的排序用不上索引、`/api/stats` 重复现场查询、broker 发布持锁等 confirm、replay dry-run 可能重复、advisory lock 还池、网关金额上限与订单金额脱钩）和 **一个零测试的工程债**，都在 `19 代码审查` 里带行号列着。
+
+刻意**没有**在本轮修改：代码将被 lock，且这批问题需要按依赖顺序改（告警可信度 → 补偿正确性 → 金额校验 → 对账补类 → 履约三件一起）。
+
 - **对账扫描用不上现有索引**：`orders_status_idx` 是 `(status, updated_at DESC)`，但对账的四个分类是 `OR` 出来的，没有 `status` 的等值条件，所以只能全表扫（几十万单以内仍是毫秒级）。真要上量应加一条部分索引：`(updated_at) where status in ('CREATED','CANCELLED')`
 
 ## Docker Hub 不可达时怎么出镜像
