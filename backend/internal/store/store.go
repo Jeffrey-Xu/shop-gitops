@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/XSAM/otelsql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -36,15 +38,43 @@ type Store struct {
 	DB *sql.DB
 }
 
-func Open(ctx context.Context, dsn string, log *slog.Logger) (*Store, error) {
-	db, err := sql.Open("pgx", dsn)
+// Open 建连接池。
+//
+// 池大小是参数而不是常量：压测时第一件要调的就是它，硬编码会把
+// 「调参」变成「改代码 + 发版 + 等 CI」。
+//
+// 用 otelsql 包住 pgx 的 database/sql 驱动，而不是在各处手写 span：
+// 一条 SQL 的耗时属于「谁都该有但谁都不想逐处写」的信息，
+// 驱动层是唯一能一次覆盖全部查询位置的地方。
+func Open(ctx context.Context, dsn string, log *slog.Logger, maxOpen, maxIdle int, maxLifetime time.Duration) (*Store, error) {
+	db, err := otelsql.Open("pgx", dsn,
+		otelsql.WithSpanNameFormatter(dbSpanName),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{
+			// readyz 每 5 秒 ping 一次。给 ping 采 span 只会把 Tempo 灌满
+			// 与业务无关的噪声，真出问题时反而找不到那一单。
+			Ping: false,
+			// 每个结果行一条 event 是 O(行数) 的噪声，一条几十行的查询
+			// 就能把单条 trace 撑到上千个 event。
+			RowsNext: false,
+			DisableErrSkip: true,
+			// prepare / reset_session 是连接池内部动作，不是业务交互。
+			OmitConnPrepare:      true,
+			OmitConnResetSession: true,
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(2 * time.Minute)
+
+	// MaxIdle 必须等于 MaxOpen。默认 database/sql 是 2：
+	// 空闲连接随时被关掉，下一个请求又要重新握手 ——
+	// 握手（TCP + 认证 + 参数下发）比复用贵一个数量级，
+	// 平时看不出，压测时就是白白多出来的一段延迟。
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(maxLifetime)
+	// 空闲不回收：靠 MaxLifetime 定期轮换就够了，让池保持温热。
+	db.SetConnMaxIdleTime(0)
 
 	var lastErr error
 	for i := 1; i <= 30; i++ {
@@ -57,11 +87,36 @@ func Open(ctx context.Context, dsn string, log *slog.Logger) (*Store, error) {
 		log.Warn("waiting_for_database", "attempt", i, "err", lastErr)
 		select {
 		case <-ctx.Done():
+			_ = db.Close()
 			return nil, ctx.Err()
 		case <-time.After(2 * time.Second):
 		}
 	}
+	_ = db.Close()
 	return nil, fmt.Errorf("database unreachable after retries: %w", lastErr)
+}
+
+// sqlTableRe 抓「操作动词 + 表名」里的表名。
+// 只认 from/into/update/table 后面的第一个标识符，够覆盖本项目的全部语句。
+var sqlTableRe = regexp.MustCompile(`(?i)\b(?:from|into|update|table)\s+([a-z_][a-z0-9_]*)`)
+
+// dbSpanName 把 SQL 收敛成「操作 + 表名」，例如 SELECT orders、INSERT outbox。
+//
+// 不能拿整条 SQL 当 span 名：参数不同就是不同的名字，基数会随数据增长
+// （WHERE id = 1 / = 2 / = 3 …），Tempo 里按名字聚合就失效了。
+// 表名 + 操作是有限集合（本项目 9 张表 × 4 种操作），聚合和报警都能用。
+func dbSpanName(_ context.Context, method otelsql.Method, query string) string {
+	fields := strings.Fields(strings.TrimSpace(query))
+	if len(fields) == 0 {
+		// BEGIN / COMMIT 这类没有 SQL 文本，用 otelsql 的方法名。
+		return string(method)
+	}
+	op := strings.ToUpper(fields[0])
+	m := sqlTableRe.FindStringSubmatch(query)
+	if len(m) < 2 {
+		return op
+	}
+	return op + " " + strings.ToLower(m[1])
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -118,6 +173,14 @@ func (s *Store) Migrate(ctx context.Context) ([]string, error) {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return applied, err
+		}
+		// DDL 合法地可能比一次请求慢（建大索引、重写表结构），
+		// 不该被请求级的 statement_timeout 掐掉。
+		// 用 SET LOCAL 而不是 SET：前者只作用于本事务，提交即失效；
+		// 用 SET 的话这条连接回池之后会带着「永不超时」去跑业务查询。
+		if _, err := tx.ExecContext(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+			_ = tx.Rollback()
+			return applied, fmt.Errorf("migration %s: clear statement_timeout: %w", name, err)
 		}
 		for i, stmt := range splitStatements(string(body)) {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {

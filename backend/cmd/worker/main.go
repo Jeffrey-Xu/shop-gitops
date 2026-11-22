@@ -45,7 +45,8 @@ func main() {
 		_ = shutdownTracing(sctx)
 	}()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL, log)
+	st, err := store.Open(ctx, cfg.DatabaseURL, log,
+		cfg.DBMaxOpen, cfg.DBMaxIdle, cfg.DBConnMaxLifetime)
 	if err != nil {
 		log.Error("database_open_failed", "err", err)
 		os.Exit(1)
@@ -55,8 +56,9 @@ func main() {
 	// worker 不跑迁移：schema 归 api 管，两个进程同时迁移只会互相等锁。
 	c, err := cache.New(ctx, cfg.RedisAddr, cfg.RedisPass, cfg.CacheTTL)
 	if err != nil {
-		log.Error("redis_init_failed", "err", err)
-		os.Exit(1)
+		// 同上：Redis 在 worker 里只用于演示开关（shop:demo:fail），
+		// 连不上就当作开关是关的，扣款照常走。
+		log.Warn("redis_unavailable_at_startup", "err", err, "impact", "演示开关失效，其余不受影响")
 	}
 	defer c.Close()
 

@@ -56,7 +56,8 @@ func main() {
 		_ = shutdownTracing(sctx)
 	}()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL, log)
+	st, err := store.Open(ctx, cfg.DatabaseURL, log,
+		cfg.DBMaxOpen, cfg.DBMaxIdle, cfg.DBConnMaxLifetime)
 	if err != nil {
 		log.Error("database_open_failed", "err", err)
 		os.Exit(1)

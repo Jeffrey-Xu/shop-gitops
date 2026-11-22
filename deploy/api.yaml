@@ -24,7 +24,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shop
 data:
-  APP_VERSION: "v6-tracing"
+  APP_VERSION: "v7-dbpool"
   LOG_LEVEL: "info"
   CACHE_TTL: "30s"
   # 打开后才注册 /api/dev/fault（演示错误率和日志链路用）
@@ -32,6 +32,17 @@ data:
   REDIS_ADDR: "host.docker.internal:6379"
   MQ_PREFETCH: "5"
   MQ_MAX_ATTEMPTS: "3"
+  # ---- 数据库连接池 ----
+  # idle 故意等于 open。两者不等时，超出的连接会被反复关掉再建，
+  # 而握手（TCP + 认证 + 参数下发）比复用贵一个数量级 —— 平时看不出，
+  # 压测时会变成一段解释不了的额外延迟。压测第一件要动的就是这两个数。
+  DB_MAX_OPEN_CONNS: "10"
+  DB_MAX_IDLE_CONNS: "10"
+  DB_CONN_MAX_LIFETIME: "5m"
+  # 单条 SQL 的服务端超时。没有它，一条卡住的查询会一直占着池里的连接：
+  # 池只有 10 个，十条就能把整个服务堵死，而且不报任何错。
+  # 迁移里的 DDL 会用 SET LOCAL 临时关掉，不受这个值限制。
+  DB_STATEMENT_TIMEOUT: "10s"
   # 支付网关地址（worker 用，api 读到也不用）。指向同命名空间的 payment Service。
   # 留空则 worker 退回内置模拟支付 —— 本地单机跑不用起 Python 服务时就这样。
   PAYMENT_URL: "http://payment:8080"

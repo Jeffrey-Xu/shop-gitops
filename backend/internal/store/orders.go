@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -78,11 +79,18 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 		totalCents += priceCents * int64(l.Quantity)
 	}
 
-	var orderID int64
+	// 顺带把 created_at / updated_at 取回来：返回值里要给前端，
+	// 拿到手就不用提交后再 SELECT 一次。
+	var (
+		orderID              int64
+		createdAt, updatedAt time.Time
+	)
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO orders (status, total_cents, idempotency_key, user_id)
 		VALUES ('CREATED', $1, $2, $3)
-		RETURNING id`, totalCents, nullIfEmpty(p.IdempotencyKey), nullIfZero(p.UserID)).Scan(&orderID)
+		RETURNING id, created_at, updated_at`,
+		totalCents, nullIfEmpty(p.IdempotencyKey), nullIfZero(p.UserID)).
+		Scan(&orderID, &createdAt, &updatedAt)
 	if isUniqueViolation(err) {
 		// 幂等键撞了：回滚（库存自动还原），把上一次的结果原样返回
 		_ = tx.Rollback()
@@ -138,8 +146,38 @@ func (s *Store) CreateOrder(ctx context.Context, p CreateOrderParams) (Order, bo
 		return Order{}, false, err
 	}
 
-	order, err := s.GetOrder(ctx, orderID)
-	return order, true, err
+	// 提交后不再回查。
+	//
+	// 原来这里调 GetOrder，等于刚刚才写进去的东西再从库里读一遍：
+	// SELECT orders + SELECT order_items + SELECT order_events，三次往返。
+	// 而这三样的内容全在手上 —— id 和两个时间戳是 RETURNING 拿的，
+	// 明细就是刚才插入的那个切片，历史事件只有一条（上一段插的那条）。
+	//
+	// 少这三次往返在本地几乎看不出（亚毫秒），但下单是整条链路的第一跳：
+	// 它的耗时会被计入每一次「点一下按钮到看到结果」的体验里，
+	// 而这条读路径的收益是零 —— 读回来的值和内存里的值必然相同。
+	//
+	// 唯一的前提：items 的顺序。这里用 product_id 升序（加锁顺序），
+	// GetOrder 用 order_items.id 升序；因为插入就是按 ordered 的顺序，
+	// 两者是同一个序列。如果以后改成并发插明细，这个假设就没了。
+	order := Order{
+		ID:         orderID,
+		UserID:     p.UserID,
+		Status:     "CREATED",
+		TotalCents: totalCents,
+		CreatedAt:  createdAt,
+		UpdatedAt:  updatedAt,
+		Items:      items,
+		History: []OrderEvent{{
+			FromStatus: "",
+			ToStatus:   "CREATED",
+			Note:       "api: order created",
+			// 同一个事务里的 now() 就是事务开始时间，
+			// 所以订单行和这条事件的 created_at 必然相等。
+			CreatedAt: createdAt,
+		}},
+	}
+	return order, true, nil
 }
 
 func (s *Store) GetOrder(ctx context.Context, id int64) (Order, error) {

@@ -35,6 +35,18 @@ type Cache struct {
 	sf  singleflight.Group
 }
 
+// New 只负责建客户端，不要求 Redis 当场可用。
+//
+// 返回的 error 是「启动时探测的结果」，不是「初始化失败」：
+// 客户端一定会返回，调用方记一条 warn 就继续跑。
+//
+// 为什么不能在 ping 失败时返回 nil：那等于把「缓存不可用」升级成
+// 「服务不可用」。而 Redis 在这个系统里是软依赖 —— 所有调用的失败路径
+// 都已经是降级处理（回源、当未命中、计数归零），启动时反而是最不该放弃的：
+// 运维重启 Redis 的那 30 秒里，Pod 会 CrashLoop，然后因为退避越起越慢，
+// 缓存早就恢复了服务还没起来。
+//
+// 注意 go-redis 的连接本来就是惰性的，ping 失败不影响后续重连。
 func New(ctx context.Context, addr, password string, ttl time.Duration) (*Cache, error) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         addr,
@@ -43,12 +55,13 @@ func New(ctx context.Context, addr, password string, ttl time.Duration) (*Cache,
 		ReadTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
 	})
+	c := &Cache{rdb: rdb, ttl: ttl}
 	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
-		return nil, fmt.Errorf("redis ping: %w", err)
+	if err := c.Ping(pingCtx); err != nil {
+		return c, fmt.Errorf("redis ping: %w", err)
 	}
-	return &Cache{rdb: rdb, ttl: ttl}, nil
+	return c, nil
 }
 
 func (c *Cache) Close() error { return c.rdb.Close() }

@@ -63,7 +63,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL, log)
+	st, err := store.Open(ctx, cfg.DatabaseURL, log,
+		cfg.DBMaxOpen, cfg.DBMaxIdle, cfg.DBConnMaxLifetime)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "连数据库失败:", err)
 		os.Exit(1)

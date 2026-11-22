@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jeffrey-Xu/shop-gitops/backend/internal/auth"
@@ -31,6 +32,10 @@ type Server struct {
 	// Signer 为 nil 表示没配 JWT_SECRET，此时所有请求都按匿名处理。
 	// 这样本地只跑 api+worker 时不需要账号服务也能下单。
 	Signer *auth.Signer
+
+	// redisDown 记住上一次探针的结果，只为了「状态翻转时打一行日志」。
+	// 放这里而不是局部变量：Server 是单实例，本来就只有一个探针序列。
+	redisDown atomic.Bool
 }
 
 func (s *Server) Handler() http.Handler {
@@ -123,19 +128,57 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // readyz 才检查依赖：依赖挂了应该被摘流量，而不是被反复重启。
+//
+// 但「依赖」不是一个整体：PostgreSQL 和 Redis 在这个服务里的地位完全不同。
+//
+//   - PG 是硬依赖。库存、订单、outbox 全在里面，连不上几乎每个接口都会 500，
+//     继续留在这个 Pod 上接流量只会把 500 放大。返回 503 让 K8s 摘掉它。
+//     注意这里是 readiness 而不是 liveness：数据库慢的时候重启应用
+//     只会让情况更糟（重启后还是要连同一个库）。
+//   - Redis 是软依赖。它只承担商品目录缓存，下单链路一次都不读。
+//     挂了正确行为是「穿透回源」——吞吐掉一截，但单还是能下。
+//     如果把它当硬依赖，一次 Redis 抖动会让整个 api 被摘流量，
+//     那就是把「降级」当成了「死亡」：明明能服务的，自己主动不服务了。
+//
+// 将来如果出现真正依赖 Redis 的强一致需求（分布式锁、限流器），
+// 这段判断要跟着改 —— 依赖的强弱是由调用路径决定的，不是由组件决定的。
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
 	if err := s.Store.Ping(ctx); err != nil {
+		obs.DependencyUp.WithLabelValues("postgres", "hard").Set(0)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "db": err.Error()})
 		return
 	}
+	obs.DependencyUp.WithLabelValues("postgres", "hard").Set(1)
+
+	redisState := "up"
 	if err := s.Cache.Ping(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "redis": err.Error()})
-		return
+		redisState = "degraded"
+		obs.DependencyUp.WithLabelValues("redis", "soft").Set(0)
+		// 探针每 5 秒跑一次，只在「掉下去」的那一刻打日志。
+		// 每次都打的话，Redis 挂一小时就是 720 行噪音，
+		// 反而把真正有用的那行「什么时候开始挂的」埋了。
+		if s.redisDown.CompareAndSwap(false, true) {
+			obs.DependencyFlaps.WithLabelValues("redis").Inc()
+			s.Log.Warn("redis_degraded",
+				"err", err,
+				"ready", true,
+				"impact", "商品目录缓存穿透回源，下单与订单查询不受影响")
+		}
+	} else {
+		obs.DependencyUp.WithLabelValues("redis", "soft").Set(1)
+		if s.redisDown.CompareAndSwap(true, false) {
+			s.Log.Info("redis_recovered")
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ready": true, "pod": s.Pod})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready": true,
+		"pod":   s.Pod,
+		"redis": redisState,
+	})
 }
 
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {

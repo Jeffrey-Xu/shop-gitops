@@ -51,7 +51,8 @@ func main() {
 		_ = shutdownTracing(sctx)
 	}()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL, log)
+	st, err := store.Open(ctx, cfg.DatabaseURL, log,
+		cfg.DBMaxOpen, cfg.DBMaxIdle, cfg.DBConnMaxLifetime)
 	if err != nil {
 		log.Error("database_open_failed", "err", err)
 		os.Exit(1)
@@ -69,8 +70,10 @@ func main() {
 
 	c, err := cache.New(ctx, cfg.RedisAddr, cfg.RedisPass, cfg.CacheTTL)
 	if err != nil {
-		log.Error("redis_init_failed", "err", err)
-		os.Exit(1)
+		// 不退出：Redis 只承担商品目录缓存，下单链路一次都不读它。
+		// 启动时连不上只意味着「接下来一段时间缓存全穿透」，
+		// 从启动就 CrashLoop 反而是把软依赖当成了硬依赖。
+		log.Warn("redis_unavailable_at_startup", "err", err, "impact", "缓存穿透回源，/readyz 报 degraded")
 	}
 	defer c.Close()
 

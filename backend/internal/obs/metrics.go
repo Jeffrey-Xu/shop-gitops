@@ -72,6 +72,22 @@ var (
 		Name: "shop_shipment_callbacks_total",
 		Help: "api 接收履约服务回写的次数",
 	}, []string{"result", "status"})
+
+	// 依赖探活：1 可用 / 0 不可用。
+	// mode 标出这个依赖挂了意味着什么：hard = Pod 被摘流量（服务不可用），
+	// soft = 只是降级（仍能接单，某个能力变慢）。同一个 0，两种含义，
+	// 混在一起看会误判事故等级。
+	DependencyUp = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shop_dependency_up",
+		Help: "依赖探活结果：1 可用 / 0 不可用",
+	}, []string{"dependency", "mode"})
+
+	// 软依赖从可用掉到降级的次数。只在状态翻转时 +1，不是每次探针都加 ——
+	// 否则就是一条随时间线性上升的斜线，看不出「挂了几次、什么时候挂的」。
+	DependencyFlaps = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shop_dependency_flaps_total",
+		Help: "依赖从可用变成不可用的次数",
+	}, []string{"dependency"})
 )
 
 func Handler() http.Handler {
