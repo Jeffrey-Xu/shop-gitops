@@ -23,19 +23,43 @@ spec:
             description: "近 5 分钟 5xx 占比 {{ $value | humanizePercentage }}，先看 Loki 里 level=error 的 request_id"
 
         - alert: ShopQueueBacklog
-          expr: shop_queue_depth > 10
+          expr: shop_queue_messages{queue="shop.order.created"} > 10
           for: 3m
           labels:
             severity: warning
           annotations:
-            summary: "订单队列积压超过 10 条"
+            summary: "订单主队列积压超过 10 条"
             description: "worker 可能挂了或消费太慢；队列 {{ $labels.queue }} 当前 {{ $value }} 条"
 
-        - alert: ShopOutboxStuck
-          expr: shop_outbox_pending > 20
-          for: 3m
+        # DLQ 非空 = 有订单走到了「放弃重试」这一步，必须有人看。
+        # 这条比任何 5xx 告警都重要：主队列是空的、大盘是绿的、
+        # 用户的钱已经扣了，而消息躺在 DLQ 里没人管。
+        - alert: ShopDlqNotEmpty
+          expr: sum(shop_queue_messages{queue=~".+\\.dlq"}) > 0
+          for: 1m
           labels:
             severity: critical
           annotations:
-            summary: "outbox 积压，事件发不出去"
-            description: "{{ $value }} 行未投递超过 3 分钟，基本可以断定 RabbitMQ 连接有问题"
+            summary: "死信队列里有消息"
+            description: "{{ $value }} 条消息进入 DLQ。先看 Loki 里带 attempts 与 last_error 的日志，确认原因后用 cmd/replay 重投"
+
+        # 年龄和计数看的是两件事：计数高但年龄小 = 吞吐跟不上（warning 够了）；
+        # 年龄单调增长 = 投递链路卡住了，计数可能还是个位数。
+        # relay 正常时这个值应该只有几秒（一个轮询周期）。
+        - alert: ShopOutboxStuckByAge
+          expr: shop_outbox_oldest_seconds > 60
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "最老一条 outbox 消息已等待 {{ $value | humanizeDuration }}"
+            description: "投递链路卡住。若是 broker 连不上，relay 会一直重试同一条；检查 RabbitMQ 连接与 relay 日志"
+
+        - alert: ShopOutboxPending
+          expr: shop_outbox_pending > 20
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "outbox 积压 {{ $value }} 行"
+            description: "量上来了但还没卡死（年龄告警未触发）。先看下单速率与 relay 的 publish 耗时"

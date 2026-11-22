@@ -24,7 +24,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: shop
 data:
-  APP_VERSION: "v7-dbpool"
+  APP_VERSION: "v8-retry"
   LOG_LEVEL: "info"
   CACHE_TTL: "30s"
   # 打开后才注册 /api/dev/fault（演示错误率和日志链路用）
@@ -32,6 +32,11 @@ data:
   REDIS_ADDR: "host.docker.internal:6379"
   MQ_PREFETCH: "5"
   MQ_MAX_ATTEMPTS: "3"
+  # 指数退避的底数：第 n 次重试等 base * 2^n，再乘 [0.5, 1.5) 的随机系数。
+  # 上限受 broker 队列级 TTL（10s）约束 —— per-message TTL 超过它会被截断，
+  # 所以 base 与 MQ_MAX_ATTEMPTS 要一起看：2s、最多重试 2 次 → 2s / 4s，
+  # 抖动后落在 1~6s，正好在 10s 以内。
+  MQ_RETRY_BASE: "2s"
   # ---- 数据库连接池 ----
   # idle 故意等于 open。两者不等时，超出的连接会被反复关掉再建，
   # 而握手（TCP + 认证 + 参数下发）比复用贵一个数量级 —— 平时看不出，

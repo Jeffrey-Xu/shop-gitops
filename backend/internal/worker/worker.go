@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
@@ -169,14 +170,47 @@ func (w *Worker) retry(ctx context.Context, msg broker.Message, ev store.OrderCr
 		"attempts":   int32(attempts + 1),
 		"last_error": cause.Error(),
 	}
-	if err := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderRetry, msg.Body, headers); err != nil {
+	delay := w.retryDelay(attempts)
+	if err := w.Broker.PublishDelayed(ctx, broker.DLX, broker.RouteOrderRetry, msg.Body, headers, delay); err != nil {
 		obs.OrdersProcessed.WithLabelValues("retry_publish_error").Inc()
 		log.Error("retry_publish_failed", "err", err)
 		return msg.Nack(true)
 	}
 	obs.OrdersProcessed.WithLabelValues("retry").Inc()
-	log.Warn("order_retry_scheduled", "err", cause, "delay_ms", broker.RetryDelayMS)
+	log.Warn("order_retry_scheduled", "err", cause, "delay_ms", delay.Milliseconds())
 	return msg.Ack()
+}
+
+// retryDelay 算这次重试该等多久：base * 2^attempts，再乘 [0.5,1.5) 的随机系数。
+//
+// 两个都必须有，缺哪个都不行：
+//   - 指数：让重试给上游留出恢复时间。固定 10 秒时，一个需要 30 秒才能好的
+//     依赖会被打三次，每次都撞在它还病着的时候。
+//   - 抖动：同一秒失败的一批订单，如果延迟完全相同，就会在第 N 秒、第 2N 秒
+//     整批回来。那不是「重试」，是把一次瞬时抖动复制成三波尖峰 ——
+//     下游刚缓过来就被同一批请求再打一次。
+//
+// 上限取 broker.RetryDelayMS（队列级 TTL）：per-message Expiration 大于它会被
+// broker 截断，表面生效实际不符。所以 base 与 MaxAttempts 要一起看：
+// 现在 base=2s、最多重试 2 次 → 2s / 4s，乘 1.5 后最长 6s，仍在 10s 以内。
+func (w *Worker) retryDelay(attempts int) time.Duration {
+	base := w.Cfg.RetryBaseDelay
+	if base <= 0 {
+		base = 2 * time.Second
+	}
+	d := base << attempts // attempts 已被调用方限定在 [0, MaxAttempts)
+	limit := time.Duration(broker.RetryDelayMS) * time.Millisecond
+	if d > limit {
+		d = limit
+	}
+	d = time.Duration(float64(d) * (0.5 + rand.Float64()))
+	if d > limit {
+		d = limit
+	}
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
 }
 
 // cancel 是共用的补偿动作：订单置 CANCELLED + 回补库存 + 删缓存。

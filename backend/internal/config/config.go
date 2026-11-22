@@ -24,6 +24,10 @@ type Config struct {
 	DevMode     bool
 	Prefetch    int
 	MaxAttempts int
+	// RetryBaseDelay 是指数退避的底数：第 n 次重试等 base * 2^n，
+	// 再乘一个 [0.5,1.5) 的随机系数。
+	// 上限受 broker 的队列级 TTL（10s）约束，改大之前先看 broker.RetryDelayMS。
+	RetryBaseDelay time.Duration
 	// PaymentURL 为空表示不接真实支付网关，worker 退回内置的模拟支付。
 	// 集群里指向 http://payment:8080（同命名空间的 Service）。
 	PaymentURL     string
@@ -76,6 +80,11 @@ func Load(service string) (Config, error) {
 		return Config{}, fmt.Errorf("DB_STATEMENT_TIMEOUT 无法解析: %w", err)
 	}
 
+	retryBase, err := time.ParseDuration(env("MQ_RETRY_BASE", "2s"))
+	if err != nil {
+		return Config{}, fmt.Errorf("MQ_RETRY_BASE 无法解析: %w", err)
+	}
+
 	dbMaxOpen := atoi(env("DB_MAX_OPEN_CONNS", "10"), 10)
 	// 默认让 idle 跟随 open：两者不相等时，多余的连接会被反复关掉再建。
 	// 显式配了 DB_MAX_IDLE_CONNS 才允许它更小（例如为了少占宿主的连接槽）。
@@ -98,6 +107,7 @@ func Load(service string) (Config, error) {
 		DevMode:     env("DEV_MODE", "false") == "true",
 		Prefetch:    atoi(env("MQ_PREFETCH", "5"), 5),
 		MaxAttempts: atoi(env("MQ_MAX_ATTEMPTS", "3"), 3),
+		RetryBaseDelay: retryBase,
 		// 故意不给默认值：没设就是「不接网关」，走模拟支付。
 		// 给了默认值会让本地跑的时候意外去连一个不存在的地址。
 		PaymentURL:     os.Getenv("PAYMENT_URL"),

@@ -101,12 +101,23 @@ func main() {
 				return
 			case <-ticker.C:
 			}
-			if depth, err := brk.QueueDepth(broker.QueueOrderCreated); err == nil {
-				obs.QueueDepth.Set(float64(depth))
+			// 6 个队列全采，尤其是两个 DLQ：主队列空、DLQ 里躺着消息
+			// 是「系统看起来正常、实际有钱收不回来」的典型形态。
+			for _, q := range broker.AllQueues {
+				depth, err := brk.QueueDepth(q)
+				if err != nil {
+					// 队列不存在或 channel 出错：不更新，让上一次的值留着。
+					// 写成 0 是最坏的选择 —— 告警会因此「自愈」。
+					continue
+				}
+				obs.QueueMessages.WithLabelValues(q).Set(float64(depth))
 			}
 			sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			if n, err := st.CountOutboxPending(sctx); err == nil {
 				obs.OutboxPending.Set(float64(n))
+			}
+			if age, err := st.OldestOutboxAge(sctx); err == nil {
+				obs.OutboxOldestSeconds.Set(age.Seconds())
 			}
 			cancel()
 		}

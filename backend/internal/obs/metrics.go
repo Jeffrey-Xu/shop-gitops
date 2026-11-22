@@ -50,14 +50,27 @@ var (
 		Help: "worker 调用支付网关的结果",
 	}, []string{"result"})
 
-	QueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "shop_queue_depth",
-		Help: "主队列积压消息数（每 15s 采样一次）",
-	})
+	// queue 标签覆盖全部 6 个队列：两个主队列、两个重试队列、两个 DLQ。
+	// 只盯主队列时 DLQ 是完全不可见的 —— 而「DLQ 非空」恰恰是
+	// 「有订单卡死、需要人介入」的唯一信号。重试队列的深度也有用：
+	// 它涨起来说明下游在持续失败，但还没到放弃的程度。
+	QueueMessages = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shop_queue_messages",
+		Help: "队列里尚未被消费的消息数（每 15s 采样一次）",
+	}, []string{"queue"})
 
 	OutboxPending = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "shop_outbox_pending",
 		Help: "已写入但尚未投递的 outbox 行数（每 15s 采样一次）",
+	})
+
+	// 最老一条未投递 outbox 消息等了多久。
+	// 比 pending 计数更能说明「链路是不是还在动」：relay 正常时这个值
+	// 只有几秒（一个轮询周期），一旦单调增长就是卡住了，
+	// 哪怕 pending 还只是个位数。
+	OutboxOldestSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shop_outbox_oldest_seconds",
+		Help: "最老一条未投递 outbox 消息的年龄（秒）",
 	})
 
 	// action: register / login；result: ok / invalid / email_taken / bad_input / error

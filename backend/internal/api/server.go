@@ -526,11 +526,16 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	depth, err := s.Broker.QueueDepth(broker.QueueOrderCreated)
-	if err != nil {
-		s.Log.Warn("queue_depth_failed", "err", err)
+	depths := make(map[string]int, len(broker.AllQueues))
+	for _, q := range broker.AllQueues {
+		d, err := s.Broker.QueueDepth(q)
+		if err != nil {
+			s.Log.Warn("queue_depth_failed", "queue", q, "err", err)
+			continue
+		}
+		depths[q] = d
+		obs.QueueMessages.WithLabelValues(q).Set(float64(d))
 	}
-	obs.QueueDepth.Set(float64(depth))
 
 	orders, err := s.Store.OrderStats(ctx)
 	if err != nil {
@@ -544,7 +549,10 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		},
 		"queue": map[string]any{
 			"name":  broker.QueueOrderCreated,
-			"depth": depth,
+			"depth": depths[broker.QueueOrderCreated],
+			// 两个 DLQ 的和：只要不是 0 就有订单卡住了，需要人看
+			"dlq": depths[broker.QueueOrderDLQ] + depths[broker.QueueOrderPaidDLQ],
+			"all": depths,
 		},
 		"orders": orders,
 		"pod":    s.Pod,
