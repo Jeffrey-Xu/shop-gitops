@@ -30,6 +30,16 @@ export const config = {
   prefetch: int('MQ_PREFETCH', 5),
   maxAttempts: int('FULFILL_MAX_ATTEMPTS', 3),
 
+  // 重试退避：第 n 次重试等 base * 2^n，再乘 [0.5,1.5) 的随机系数。
+  // 与 Go 侧 worker.retryDelay 用同一套公式 —— 同一条链路的两个消费者，
+  // 重试节奏不该长得不一样（否则「order.created 已经退了 4 秒，
+  // order.paid 还在整 10 秒一次」这种差异只能靠翻代码才发现）。
+  //
+  // 上限不能超过 retry 队列的 x-message-ttl（Go 侧 broker 声明的是 10s）：
+  // per-message expiration 比队列 TTL 大时会被 broker 截断，表面生效实际不符。
+  retryBaseMs: int('FULFILL_RETRY_BASE_MS', 2000),
+  retryMaxDelayMs: int('FULFILL_RETRY_MAX_MS', 10000),
+
   // 回写订单状态要调 Go 的 api。这里不直连数据库，
   // 因为 orders 表的写入口只能有一个。
   apiUrl: process.env.SHOP_API_URL ?? 'http://api:8080',

@@ -7,9 +7,10 @@
 // 然后不再下单。上一版更糟：重试耗尽时把它 cancel 掉，
 // 变成「钱收了、单作废、还不退款」。
 //
-// 四类差异、四种处置，绝不能混为一谈（详见 store.MismatchKind）：
+// 五类差异、五种处置，绝不能混为一谈（详见 store.MismatchKind）：
 //
 //	stuck_paid          已扣款、订单还 CREATED          → 前推到 PAID（幂等）
+//	stuck_unpaid        未扣款、订单停在 CREATED        → 只报告：查 DLQ / backfill
 //	paid_but_cancelled  已扣款、订单已 CANCELLED        → 退款
 //	amount_mismatch     扣款金额 ≠ 订单金额             → 只报告，人看
 //	paid_but_declined   订单 PAID、网关 failed          → 只报告，人看
@@ -57,6 +58,16 @@ var kinds = []kindMeta{
 		auto:   true,
 	},
 	{
+		// 唯一「什么都没发生」的一类：钱没动，但库存被占着、订单永远不动。
+		// 不自动处置：没有任何扣款记录也可能是「worker 还没轮到它」，
+		// 宽限期只能挡住一部分误报，而错取消比晚发货更糟。
+		kind:   store.KindStuckUnpaid,
+		alias:  "stuck-unpaid",
+		impact: "库存占着、钱没动、订单不动",
+		action: "只报告：先查 DLQ 与 outbox，确认放弃后手工取消",
+		auto:   false,
+	},
+	{
 		kind:   store.KindPaidButCancelled,
 		alias:  "paid-but-cancelled",
 		impact: "钱已收、单作废",
@@ -84,7 +95,7 @@ func main() {
 	refund := flag.Bool("refund", false, "允许退款。没有它时 paid_but_cancelled 只列出来，不动钱")
 	minAge := flag.Duration("min-age", store.DefaultMismatchGrace, "订单最后更新多久之后才算不一致")
 	limit := flag.Int("limit", 200, "最多列出多少条")
-	kindFlag := flag.String("kind", "all", "stuck-paid | paid-but-cancelled | amount-mismatch | paid-but-declined | all")
+	kindFlag := flag.String("kind", "all", "stuck-paid | stuck-unpaid | paid-but-cancelled | amount-mismatch | paid-but-declined | all")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -145,7 +156,7 @@ func main() {
 		fmt.Fprintln(tw, "  订单\t订单状态\t支付状态\t订单金额\t扣款金额\t支付单号\t已退款\t年龄")
 		for _, m := range batch {
 			fmt.Fprintf(tw, "  %d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				m.OrderID, m.OrderStatus, m.PaymentStatus,
+				m.OrderID, m.OrderStatus, orDash(m.PaymentStatus),
 				money(m.OrderCents), money(m.PaymentCents),
 				orDash(m.PaymentID), yesNo(m.Refunded), age(m.AgeSeconds))
 		}

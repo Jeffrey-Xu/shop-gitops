@@ -560,8 +560,21 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFault 只用于演示：在 Grafana 里看错误率和日志链路。
+//
+// 两道门，缺一不可：
+//  1. DEV_MODE 打开 —— 这些端点只存在于演示环境；
+//  2. 带对的 X-Internal-Token —— 演示环境也是集群里的真实地址，
+//     只靠 DEV_MODE 意味着任何一个能访问 api 的人都可以
+//     `curl -X POST '/api/dev/fault?type=panic'` 把 Pod 打挂。
+//     不配密钥时端点干脆不存在，避免「空 == 空」意外放行。
 func (s *Server) handleFault(w http.ResponseWriter, r *http.Request) {
-	if !s.Cfg.DevMode {
+	if !s.Cfg.DevMode || s.Cfg.InternalToken == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if subtle.ConstantTimeCompare(
+		[]byte(r.Header.Get("X-Internal-Token")), []byte(s.Cfg.InternalToken)) != 1 {
+		s.Log.Warn("fault_injection_denied", "remote", r.RemoteAddr)
 		http.NotFound(w, r)
 		return
 	}

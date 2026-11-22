@@ -32,6 +32,24 @@ func Run(ctx context.Context, log *slog.Logger, st *store.Store, brk *broker.Bro
 			log.Error("outbox_fetch_failed", "err", err)
 			continue
 		}
+
+		// 先把「重试用尽、且已经挂了足够久」的消息标成死信。
+		// 为什么放在每轮开头而不是失败分支里：判定要用「这行存在多久」，
+		// 一条消息这轮刚失败、还没到年龄门槛时不该死，下一轮才可能死 ——
+		// 交给 SQL 的 created_at 条件比在 Go 里再维护一份状态更准。
+		//
+		// 没有这一步，attempts 到顶的消息会永远悬空：FetchOutbox 不再取它，
+		// 可见性查询又把它算作 pending —— 年龄单调涨、告警永久 firing。
+		if n, derr := st.MarkOutboxDeadExhausted(ctx, store.OutboxMaxAttempts, store.OutboxDeadAfter); derr != nil {
+			log.Error("outbox_mark_dead_failed", "err", derr)
+		} else if n > 0 {
+			obs.OutboxPublished.WithLabelValues("dead").Inc()
+			log.Error("outbox_dead",
+				"count", n,
+				"impact", "这些消息不会再投递，订单事件永久丢失，看 outbox.last_error 后用 cmd/backfill 补",
+			)
+		}
+
 		if len(msgs) == 0 {
 			continue
 		}
@@ -48,7 +66,7 @@ func Run(ctx context.Context, log *slog.Logger, st *store.Store, brk *broker.Bro
 			if err != nil {
 				obs.OutboxPublished.WithLabelValues("error").Inc()
 				log.Error("outbox_publish_failed", "outbox_id", m.ID, "topic", m.Topic, "attempts", m.Attempts+1, "err", err)
-				if e := st.MarkOutboxFailed(ctx, m.ID); e != nil {
+				if e := st.MarkOutboxFailed(ctx, m.ID, err.Error()); e != nil {
 					log.Error("outbox_mark_failed", "outbox_id", m.ID, "err", e)
 				}
 				// broker 有问题时后面的也发不出去，等下一轮

@@ -62,8 +62,13 @@ export class OrderPaidConsumer {
 
     this.#ch = await this.#conn.createChannel();
     // 回写用的独立 channel：消费 channel 的 prefetch / ack 状态
-    // 不该被 publish 的错误连累
-    this.#pub = await this.#conn.createChannel();
+    // 不该被 publish 的错误连累。
+    //
+    // 必须是 confirm channel：普通 channel 的 publish 只是写进本地 socket
+    // 缓冲就返回成功，broker 那一刻挂了消息照样丢。而这里的用法是
+    // 「publish 完立刻 ack 原消息」—— 两件事之间没有任何东西兜底，
+    // 只有 publisher confirm 能把它变成「broker 收下了才算成功」。
+    this.#pub = await this.#conn.createConfirmChannel();
     await this.#ch.prefetch(config.prefetch);
 
     await this.#waitForQueue();
@@ -133,11 +138,13 @@ export class OrderPaidConsumer {
       try {
         event = JSON.parse(msg.content.toString());
       } catch (err) {
-        // 解不开的消息重试一万次也解不开，直接 ACK 丢弃。
-        // 真实项目应该落到一张 poison_messages 表里留证据。
+        // 解不开的消息重试一万次也解不开，但**不能直接 ack 丢弃** ——
+        // 那等于把「有一条消息我们处理不了」这个事实一起删掉。
+        // Go 侧 worker 已经把同样的情况改成进 DLQ 留证据，
+        // 这里必须一致：否则同一个故障在两条链路上的可观测性完全不同。
         span.setStatus({ code: SpanStatusCode.ERROR, message: 'bad_event_payload' });
         logger.error({ err: err.message, raw: msg.content.toString().slice(0, 200) }, 'bad_event_payload');
-        this.#ack(msg);
+        await this.#deadLetter(msg, `unmarshal: ${err.message}`);
         return;
       }
 
@@ -176,8 +183,61 @@ export class OrderPaidConsumer {
   }
 
   /**
-   * 重试走延迟队列（TTL 10s 后死信回主队列），不是 nack+requeue。
+   * #publishConfirmed 发一条消息并等 broker 的 confirm。
+   *
+   * 为什么每个 publish 都要等：这里所有的 publish 后面都跟着 ack 原消息。
+   * 不等 confirm 的话，「消息还没到 broker」和「原消息已经 ack」之间
+   * 有一段没有任何保护的窗口，broker 一重启就永久丢一条发货单。
+   * 代价是每条消息多一个 RTT —— 这比丢单便宜得多。
+   */
+  #publishConfirmed(route, content, options) {
+    return new Promise((resolve, reject) => {
+      try {
+        this.#pub.publish(config.retryExchange, route, content, options, (err) =>
+          err ? reject(err) : resolve(),
+        );
+      } catch (err) {
+        // channel 已关闭时 publish 会同步抛错，包成 reject 让调用方走同一条路
+        reject(err);
+      }
+    });
+  }
+
+  /**
+   * #deadLetter 把一条**无法处理**的消息原样送进 DLQ，然后 ack。
+   *
+   * 和重试的区别：重试是「这次不行，再给它机会」，这里是「它永远不行」。
+   * 所以 attempts 直接写成上限 —— cmd/replay 靠这个值判断还值不值得重投，
+   * 留着原来的小数字会让人以为「再放回去就能好」。
+   */
+  async #deadLetter(msg, reason) {
+    const headers = { attempts: config.maxAttempts, last_error: String(reason).slice(0, 500) };
+    propagation.inject(context.active(), headers);
+    try {
+      await this.#publishConfirmed(config.dlqRoute, msg.content, {
+        contentType: 'application/json',
+        persistent: true,
+        headers,
+      });
+      logger.warn({ reason, size: msg.content.length }, 'message_dead_lettered');
+      this.#ack(msg);
+    } catch (err) {
+      // 连 DLQ 都发不出去：把原消息退回队列，不能既没发出去又 ack 掉
+      logger.error({ err: err.message }, 'dead_letter_publish_failed');
+      try {
+        this.#ch.nack(msg, false, true);
+      } catch (nackErr) {
+        logger.error({ err: nackErr.message }, 'nack_failed');
+      }
+    }
+  }
+
+  /**
+   * 重试走延迟队列（TTL 后死信回主队列），不是 nack+requeue。
    * requeue 会立刻重新入队，三次重试在几毫秒内跑完，等于没有退避。
+   *
+   * 延迟用 per-message expiration 而不是只靠队列级 TTL：
+   * 队列 TTL 是常量，所有重试都等同一个 10 秒，和「指数退避」是两回事。
    */
   async #retryOrDrop(msg, event, attempts, err) {
     const next = attempts + 1;
@@ -190,19 +250,23 @@ export class OrderPaidConsumer {
     // 注入后重试的 consume 会挂在本次 consume 下面，一条 trace 看全四次尝试。
     propagation.inject(context.active(), headers);
 
-    const target =
-      next >= config.maxAttempts
-        ? { route: config.dlqRoute, label: 'dlq' }
-        : { route: config.retryRoute, label: 'retry' };
+    const exhausted = next >= config.maxAttempts;
+    const target = exhausted
+      ? { route: config.dlqRoute, label: 'dlq' }
+      : { route: config.retryRoute, label: 'retry' };
+
+    const options = { contentType: 'application/json', persistent: true, headers };
+    if (!exhausted) {
+      // 只有重试消息带 expiration。DLQ 消息绝不能带：
+      // 带过期时间的死信在 DLQ 里放够时间会被 broker 直接丢掉，
+      // 「留证据」反而变成「留一会儿就没了」。
+      options.expiration = String(retryDelayMs(attempts));
+    }
 
     try {
-      this.#pub.publish(config.retryExchange, target.route, msg.content, {
-        contentType: 'application/json',
-        persistent: true,
-        headers,
-      });
+      await this.#publishConfirmed(target.route, msg.content, options);
       logger.warn(
-        { orderId: event.orderId, attempt: next, next: target.label },
+        { orderId: event.orderId, attempt: next, next: target.label, delayMs: options.expiration },
         'fulfill_retry_scheduled',
       );
       this.#ack(msg);
@@ -231,6 +295,23 @@ export class OrderPaidConsumer {
       logger.warn({ err: err.message }, 'consumer_close_error');
     }
   }
+}
+
+/**
+ * retryDelayMs 算第 attempts 次失败后该等多久：base * 2^attempts，
+ * 乘 [0.5,1.5) 的随机系数，封顶在队列 TTL 以内。
+ *
+ * 指数是为了给下游留恢复时间（固定 10 秒时，需要 30 秒才能好的依赖
+ * 会被连打三次，每次都撞在它还病着的时候）；
+ * 抖动是为了不让同一秒失败的一批消息在第 N、2N、3N 秒整批回来 ——
+ * 那不是重试，是把一次瞬时抖动复制成三波尖峰。
+ */
+function retryDelayMs(attempts) {
+  const raw = config.retryBaseMs * 2 ** attempts;
+  const capped = Math.min(raw, config.retryMaxDelayMs);
+  const jittered = Math.round(capped * (0.5 + Math.random()));
+  // 至少 1ms：expiration 是字符串，写 "0" 会让消息立刻过期
+  return Math.max(1, Math.min(jittered, config.retryMaxDelayMs));
 }
 
 /**

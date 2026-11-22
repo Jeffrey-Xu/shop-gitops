@@ -107,20 +107,48 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 		note = chargeNote(paymentID)
 		log.Info("reuse_captured_payment", "payment_id", paymentID)
 	} else {
-		// 真正的支付动作。三种结局必须分开，这是这段代码的核心：
+		// 真正的支付动作。四种结局必须分开，这是这段代码的核心：
 		//   成功            → 继续把订单推进到 PAID
 		//   拒付 Declined   → 业务终态，重试没意义，直接取消 + 回补库存
-		//   其他 error      → 临时故障（超时/5xx），走退避重试
+		//   金额不符        → 钱动了但不能记账，进 DLQ 等人核实（绝不取消）
+		//   请求被拒(4xx)   → 我们自己的 bug，进 DLQ 但不取消（走了就看不见了）
+		//   其他 error      → 临时故障（超时/5xx/429），走退避重试
 		var cerr error
 		note, paymentID, cerr = w.charge(ctx, ev, attempts, log)
-		var declined *payment.DeclinedError
+		var (
+			declined *payment.DeclinedError
+			mismatch *payment.AmountMismatchError
+			rejected *payment.RequestRejectedError
+		)
 		switch {
 		case errors.As(cerr, &declined):
+			// 补偿必须做成之后再 ack。做不成（DB 抖动）就退回队列重来 ——
+			// 先 ack 再补偿的话，补偿失败就只剩一行日志：
+			// 订单停在 CREATED、库存没回补、消息已经消失，三样全错。
 			obs.PaymentCalls.WithLabelValues("declined").Inc()
-			w.cancel(ctx, ev, log, "order_cancelled_on_decline",
-				"worker: payment declined: "+declined.Reason)
+			if err := w.cancel(ctx, ev, log, "order_cancelled_on_decline",
+				"worker: payment declined: "+declined.Reason); err != nil {
+				return msg.Nack(true)
+			}
 			_ = msg.Ack()
 			return nil
+
+		case errors.As(cerr, &mismatch):
+			// 网关那边已经落账（只是金额和我们以为的不一样），
+			// 所以这条路径和「扣款后收尾失败」同级：不许取消订单。
+			// 进 DLQ 留证据，对账会把它归到 amount_mismatch，等人核实。
+			obs.PaymentCalls.WithLabelValues("amount_mismatch").Inc()
+			return w.halt(ctx, msg, log, attempts,
+				"支付金额不符: "+mismatch.Error(), mismatch.PaymentID)
+
+		case errors.As(cerr, &rejected):
+			// 400/422 说明请求本身有问题（金额为负、字段缺失），是我们的 bug。
+			// 把它当拒付去取消订单，等于拿用户当 bug 的替罪羊：
+			// 订单作废、库存回补，而代码里的问题一点痕迹都不留。
+			// 停在这里，让对账的 stuck_unpaid 每天把它顶出来。
+			obs.PaymentCalls.WithLabelValues("rejected").Inc()
+			return w.halt(ctx, msg, log, attempts, rejected.Error(), "")
+
 		case cerr != nil:
 			obs.PaymentCalls.WithLabelValues("error").Inc()
 			return w.retry(ctx, msg, ev, attempts, log, cerr)
@@ -224,16 +252,15 @@ func (w *Worker) reschedule(ctx context.Context, msg broker.Message, ev store.Or
 	}
 
 	if attempts+1 >= w.Cfg.MaxAttempts {
-		if err := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderDLQ, msg.Body, headers); err != nil {
-			obs.OrdersProcessed.WithLabelValues("dlq_publish_error").Inc()
-			log.Error("dlq_publish_failed", "err", err)
-			return msg.Nack(true)
-		}
-
 		if paymentID != "" {
 			// 订单故意留在 CREATED：钱已经收了，这个单必须被前推，
 			// 不能被补偿成 CANCELLED。reconcile 会把它算进 stuck_paid，
 			// replay 这条 DLQ 消息也能带上 payment_id 直接重放。
+			if err := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderDLQ, msg.Body, headers); err != nil {
+				obs.OrdersProcessed.WithLabelValues("dlq_publish_error").Inc()
+				log.Error("dlq_publish_failed", "err", err)
+				return msg.Nack(true)
+			}
 			obs.OrdersProcessed.WithLabelValues("dlq_after_charge").Inc()
 			log.Error("finalize_failed_after_charge",
 				"payment_id", paymentID,
@@ -242,10 +269,21 @@ func (w *Worker) reschedule(ctx context.Context, msg broker.Message, ev store.Or
 			return msg.Ack()
 		}
 
-		// 补偿：订单作废 + 库存回补（库存是下单时预扣的）
-		w.cancel(ctx, ev, log, "order_cancelled_after_retries",
-			"worker: payment failed after retries: "+cause.Error())
+		// 还没扣到钱：先补偿、后留证据。顺序不能反 ——
+		// 先发 DLQ 再取消的话，取消一失败就变成「消息躺在 DLQ 等人捞，
+		// 而订单还活着、库存还扣着」，DLQ 里的证据反而把人引向错误的方向。
+		// 反过来「取消成功、DLQ 发布失败」是可以接受的：Nack(true) 让消息
+		// 重新投递，消费端看到 CANCELLED 会 skip，代价只是少一条死信记录。
+		if err := w.cancel(ctx, ev, log, "order_cancelled_after_retries",
+			"worker: payment failed after retries: "+cause.Error()); err != nil {
+			return msg.Nack(true)
+		}
 
+		if err := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderDLQ, msg.Body, headers); err != nil {
+			obs.OrdersProcessed.WithLabelValues("dlq_publish_error").Inc()
+			log.Error("dlq_publish_failed", "err", err)
+			return msg.Nack(true)
+		}
 		return msg.Ack()
 	}
 
@@ -292,28 +330,71 @@ func (w *Worker) retryDelay(attempts int) time.Duration {
 	return d
 }
 
+// halt 把消息直接放进 DLQ 并 ack：语义是「不要再自动试了」。
+//
+// 和 retryAfterCharge 的区别在于它不是「暂时失败」，而是「继续下去会
+// 制造更糟的状态」：金额不符时把订单标 PAID 等于按错价发货；
+// 请求被拒时取消订单等于替 bug 销毁证据。这两种都该停在原地等人看。
+//
+// 注意 ack 只在 publish 成功之后：发不出去就退回队列，
+// 「钱动了但记录没了」是这里最不能出现的结果。
+func (w *Worker) halt(ctx context.Context, msg broker.Message, log *slog.Logger, attempts int, reason, paymentID string) error {
+	headers := amqp.Table{
+		// 直接把 attempts 顶到上限：replay 工具靠它判断这条消息还值不值得重投
+		"attempts":   int32(w.Cfg.MaxAttempts),
+		"last_error": reason,
+		"halted":     true,
+	}
+	if paymentID != "" {
+		headers["payment_id"] = paymentID
+	}
+	if err := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderDLQ, msg.Body, headers); err != nil {
+		obs.OrdersProcessed.WithLabelValues("dlq_publish_error").Inc()
+		log.Error("halt_publish_failed", "err", err)
+		return msg.Nack(true)
+	}
+	obs.OrdersProcessed.WithLabelValues("halted").Inc()
+	log.Error("order_halted",
+		"reason", reason,
+		"payment_id", paymentID,
+		"attempts", attempts+1,
+		"impact", "订单状态未变，等人工核实；reconcile 会把它列出来",
+	)
+	return msg.Ack()
+}
+
 // cancel 是共用的补偿动作：订单置 CANCELLED + 回补库存 + 删缓存。
 // 拒付和重试耗尽两条路径都走它，避免逻辑各写一份然后漂移。
-func (w *Worker) cancel(ctx context.Context, ev store.OrderCreatedEvent, log *slog.Logger, logKey, note string) {
+//
+// 返回 error 是刻意的：调用方必须先确认补偿真的做成了才能 ack。
+// 之前这里失败只打一行日志，而调用方无条件 ack —— DB 抖一下就变成
+// 「订单停在 CREATED、库存没回补、消息已经消失」，而且对账看不见
+// （没有 payments 行）。补偿失败是可重试的，把消息退回去即可。
+func (w *Worker) cancel(ctx context.Context, ev store.OrderCreatedEvent, log *slog.Logger, logKey, note string) error {
 	changed, productIDs, err := w.Store.CancelOrder(ctx, ev.OrderID, note)
 	if err != nil {
-		log.Error("compensation_failed", "err", err)
-		return
+		log.Error("compensation_failed", "err", err,
+			"impact", "订单未作废、库存未回补；消息会退回队列重试")
+		return err
 	}
 	if !changed {
 		log.Info("order_already_finalized")
-		return
+		return nil
 	}
 
 	keys := []string{cache.KeyProductList}
 	for _, id := range productIDs {
 		keys = append(keys, cache.KeyProduct(id))
 	}
+	// 缓存失效失败不影响正确性：key 有 30s TTL，最坏情况是 30 秒内
+	// 商品页显示一个已经被买走的库存数。为此把已经成功的补偿退回去
+	// （Nack 重跑）反而会重复回补库存，更糟。
 	if err := w.Cache.Del(ctx, keys...); err != nil {
 		log.Warn("cache_invalidate_failed", "keys", keys, "err", err)
 	}
 	obs.OrdersProcessed.WithLabelValues("cancelled").Inc()
 	log.Error(logKey, "reason", note)
+	return nil
 }
 
 func headerInt(h amqp.Table, key string) int {

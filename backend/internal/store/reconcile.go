@@ -43,6 +43,18 @@ const (
 	// 订单 PAID，但网关那边是 failed。钱没收到却准备发货。
 	// 处置：人工核实（可能是网关侧事后反转，也可能有人改了库）。
 	KindPaidButDeclined MismatchKind = "paid_but_declined"
+
+	// 订单停在 CREATED，而网关侧**根本没有这笔扣款记录**。
+	//
+	// 这一类是最难发现、也最容易被忽略的：outbox 没投出去、消息躺在 DLQ
+	// 没人捞、worker 在调网关之前就崩了 —— 结果都是「库存扣了、钱没动、
+	// 订单永远不动」。它没有任何一条 payments 行，所以四类里一个都匹配不上。
+	// 而它恰恰是对账最该看的东西：用户没被扣钱，但商品卖不出去了。
+	//
+	// 处置：人工确认（先看 DLQ、再看 backfill），必要时取消订单回收库存。
+	// 不自动处置 —— 「没有任何扣款记录」也可能是刚下单还没轮到 worker，
+	// 宽限期只能挡住一部分误报，钱没动的情况下误取消比晚发货更糟。
+	KindStuckUnpaid MismatchKind = "stuck_unpaid"
 )
 
 // ErrPaymentsTableMissing 表示对账的数据源还不存在。
@@ -73,7 +85,9 @@ type Mismatch struct {
 // 所以超过两分钟还是 CREATED，就一定不是「正在处理」。
 const DefaultMismatchGrace = 2 * time.Minute
 
-const mismatchSelect = `
+// mismatchPaidSelect 是「网关有扣款记录」的那一支：四类差异都来自
+// payments 与 orders 的对比，所以用 INNER JOIN。
+const mismatchPaidSelect = `
 SELECT CASE
          WHEN p.amount_cents <> o.total_cents THEN 'amount_mismatch'
          WHEN o.status = 'CREATED'   AND p.status = 'succeeded' THEN 'stuck_paid'
@@ -96,6 +110,30 @@ SELECT CASE
      OR (o.status = 'CREATED'   AND p.status = 'succeeded')
      OR (o.status = 'CANCELLED' AND p.status = 'succeeded')
      OR (o.status = 'PAID'      AND p.status = 'failed'))`
+
+// mismatchUnpaidSelect 是「网关没有记录」的那一支，必须是独立的一条查询：
+// INNER JOIN 会把这类订单整个过滤掉，这正是它此前完全不可见的原因。
+//
+// 用 LEFT JOIN + IS NULL 而不是 NOT EXISTS：payments.order_id 是主键，
+// anti-join 走得到索引；写成 NOT IN 则会因为 NULL 语义悄悄返回空集。
+//
+// 只取 CREATED：CANCELLED 且没扣过款是**完全一致**的状态
+// （单作废、钱没动），把它算成差异只会制造噪声。
+const mismatchUnpaidSelect = `
+SELECT 'stuck_unpaid' AS kind,
+       o.id,
+       o.status,
+       '' AS payment_status,
+       o.total_cents,
+       0::bigint AS amount_cents,
+       '' AS payment_id,
+       false AS refunded,
+       EXTRACT(EPOCH FROM now() - o.updated_at)::float8 AS age_s
+  FROM orders o
+  LEFT JOIN payments p ON p.order_id = o.id::text
+ WHERE p.order_id IS NULL
+   AND o.status = 'CREATED'
+   AND o.updated_at < now() - make_interval(secs => $1)`
 
 // mismatchSQL 按「refunds 表存不存在」拼两种形态。
 //
@@ -124,8 +162,14 @@ func (s *Store) mismatchSQL(ctx context.Context) (detail, counts string, err err
 		join = "LEFT JOIN refunds r ON r.order_id = p.order_id"
 	}
 
-	sel := fmt.Sprintf(mismatchSelect, refundedExpr, join)
-	detail = sel + ` ORDER BY o.id LIMIT $2`
+	// 两支 UNION ALL 拼成一个「不一致」集合。两侧列的顺序与类型必须完全一致：
+	// 缺 payments 行时 payment_status / payment_id 用空串、金额用 0，
+	// 调用方靠 kind 判断该不该读这些字段（stuck_unpaid 一律不读）。
+	sel := "(" + fmt.Sprintf(mismatchPaidSelect, refundedExpr, join) + ")"
+	sel += " UNION ALL (" + mismatchUnpaidSelect + ")"
+
+	// ORDER BY 只能引用输出列名，不能写 o.id —— UNION 之上已经没有表别名了。
+	detail = sel + ` ORDER BY id LIMIT $2`
 	// 计数口径和明细不同：明细要留证据（已退款的也列出来，标「已退款」），
 	// 计数只算「还需要动手的」。退过款的 paid_but_cancelled 已经收敛 ——
 	// 钱回去了、单也作废了，它再继续顶着告警，只会训练人忽略告警。
@@ -174,7 +218,11 @@ func (s *Store) ScanMismatches(ctx context.Context, minAge time.Duration, limit 
 //
 // 为什么不复用 ScanMismatches 再数长度：卡死 5000 单的时候，
 // 把 5000 行读进内存只为了导出一个数字，是拿数据库和 GC 开玩笑。
-// COUNT 在库侧做完，返回四行。
+// COUNT 在库侧做完，返回五行。
+//
+// 五类都要预置 0：指标是按 kind 分开的 gauge，某一类一条都没有时
+// 也必须导出 0，否则「从 0 变成 1」这个最关键的变化在 Prometheus 里
+// 表现为「新时间序列出现」，rate/increase 全都算不出来。
 func (s *Store) CountMismatches(ctx context.Context, minAge time.Duration) (map[MismatchKind]int64, error) {
 	_, counts, err := s.mismatchSQL(ctx)
 	if err != nil {
@@ -187,9 +235,10 @@ func (s *Store) CountMismatches(ctx context.Context, minAge time.Duration) (map[
 	}
 	defer rows.Close()
 
-	out := make(map[MismatchKind]int64, 4)
+	out := make(map[MismatchKind]int64, 5)
 	for _, k := range []MismatchKind{
-		KindAmountMismatch, KindStuckPaid, KindPaidButCancelled, KindPaidButDeclined,
+		KindAmountMismatch, KindStuckPaid, KindStuckUnpaid,
+		KindPaidButCancelled, KindPaidButDeclined,
 	} {
 		out[k] = 0
 	}

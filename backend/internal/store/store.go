@@ -129,28 +129,68 @@ func (s *Store) Close() error { return s.DB.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.DB.PingContext(ctx) }
 
 // Migrate 在拿到 advisory lock 之后按文件名顺序执行未应用的迁移。
-// 用 advisory lock 是因为将来 api 一旦 >1 副本，两个实例会同时启动；
-// 没锁的话两个进程会同时跑 DDL 然后互相把对方锁死。
+//
+// 并发保护用**事务级**锁（pg_advisory_xact_lock）而不是 pg_advisory_lock：
+// 后者是会话级的，而 conn.Close() 只是把连接还回池里 —— 会话还活着，
+// 锁就一直被那条池化连接持有，直到它被 MaxLifetime 回收。
+// 那段时间里另一个实例启动会卡在等锁上，表现成「迁移永远跑不完」，
+// 而日志里什么都没有。事务级锁随提交/回滚自动释放，没有「忘了解锁」这种状态。
+//
+// 顺带把所有迁移放进同一个事务：PostgreSQL 的 DDL 是事务性的，
+// 中途失败不会留下「跑了一半」的结构。代价是一次启动期的长事务，
+// 对迁移来说完全可接受。
 func (s *Store) Migrate(ctx context.Context) ([]string, error) {
-	if _, err := s.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version    TEXT PRIMARY KEY,
-		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-	)`); err != nil {
-		return nil, fmt.Errorf("create schema_migrations: %w", err)
-	}
-
 	conn, err := s.DB.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationLock); err != nil {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	// 成功提交之后 Rollback 返回 ErrTxDone，可以安全地无条件 defer。
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationLock); err != nil {
 		return nil, fmt.Errorf("advisory lock: %w", err)
 	}
-	defer func() {
-		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLock)
-	}()
+
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version    TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil {
+		return nil, fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	// DDL 合法地可能比一次请求慢（建大索引、重写表结构），
+	// 不该被请求级的 statement_timeout 掐掉。
+	// 用 SET LOCAL 而不是 SET：前者只作用于本事务，提交即失效；
+	// 用 SET 的话这条连接回池之后会带着「永不超时」去跑业务查询。
+	if _, err := tx.ExecContext(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
+		return nil, fmt.Errorf("clear statement_timeout: %w", err)
+	}
+
+	// 一次读全体已应用的版本，而不是每个文件一条 SELECT：
+	// 迁移文件会越攒越多，N 次往返没必要。
+	done := make(map[string]bool, 8)
+	rows, err := tx.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		done[v] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	entries, err := fs.ReadDir(migrationsFS, "migrations")
 	if err != nil {
@@ -161,12 +201,7 @@ func (s *Store) Migrate(ctx context.Context) ([]string, error) {
 	var applied []string
 	for _, e := range entries {
 		name := e.Name()
-		var exists bool
-		if err := conn.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, name).Scan(&exists); err != nil {
-			return applied, err
-		}
-		if exists {
+		if done[name] {
 			continue
 		}
 
@@ -175,32 +210,18 @@ func (s *Store) Migrate(ctx context.Context) ([]string, error) {
 			return applied, err
 		}
 
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return applied, err
-		}
-		// DDL 合法地可能比一次请求慢（建大索引、重写表结构），
-		// 不该被请求级的 statement_timeout 掐掉。
-		// 用 SET LOCAL 而不是 SET：前者只作用于本事务，提交即失效；
-		// 用 SET 的话这条连接回池之后会带着「永不超时」去跑业务查询。
-		if _, err := tx.ExecContext(ctx, `SET LOCAL statement_timeout = 0`); err != nil {
-			_ = tx.Rollback()
-			return applied, fmt.Errorf("migration %s: clear statement_timeout: %w", name, err)
-		}
 		for i, stmt := range splitStatements(string(body)) {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				_ = tx.Rollback()
 				return applied, fmt.Errorf("migration %s stmt %d: %w", name, i+1, err)
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, name); err != nil {
-			_ = tx.Rollback()
-			return applied, err
-		}
-		if err := tx.Commit(); err != nil {
 			return applied, err
 		}
 		applied = append(applied, name)
+	}
+	if err := tx.Commit(); err != nil {
+		return applied, err
 	}
 	return applied, nil
 }

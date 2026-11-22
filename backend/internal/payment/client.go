@@ -1,11 +1,15 @@
 // Package payment 是对外部支付网关（payment-service，Python/FastAPI）的最小客户端。
 //
-// 三个设计要点：
+// 四个设计要点：
 //  1. 拒付（网关正常响应但结果 failed）是**业务终态**，重试一百次也是同一张卡被拒，
 //     所以单独用 *DeclinedError 表示，让调用方走「取消订单 + 回补库存」而不是退避重试。
-//  2. 超时 / 连接失败 / 5xx 是**临时故障**，返回普通 error，交给 worker 的 retry 链路。
+//  2. 超时 / 连接失败 / 5xx / 429 是**临时故障**，返回普通 error，交给 worker 的 retry 链路。
 //  3. 幂等由对端保证（order_id 是 payments 的主键），因此重试是安全的：
-//     重放只会拿到第一次的结果，不会重复扣款。
+//     重放只会拿到第一次的结果，不会重复扣款。**但也正因为幂等**，
+//     金额校验必须自己查 —— 重放拿到的是第一次的金额，不是这一次请求的。
+//  4. 另有两类响应既不是「重试能好」也不是「拒付」，单独建模：
+//     *RequestRejectedError（400/422 这类我们自己的 bug）与
+//     *AmountMismatchError（钱动了但数目不对）。两者都不许取消订单。
 package payment
 
 import (
@@ -47,6 +51,40 @@ func (e *DeclinedError) Error() string {
 		return "支付被拒付"
 	}
 	return "支付被拒付: " + e.Reason
+}
+
+// AmountMismatchError 表示网关返回的金额与我们请求的不一致。
+//
+// 它几乎总是和幂等一起出现：网关对同一个 order_id 返回**第一次扣款的金额**，
+// 所以两次调用之间订单价格一变（改价、优惠券过期、数量被改），
+// 就会出现「用户按旧价被扣、订单按新价准备标 PAID」—— 差额没有任何人看得见。
+// 只检查 status 是查不出这种事的：status 仍然是 succeeded。
+//
+// 不重试（重试拿到的是同一笔），也不当拒付（钱已经动了，订单不该被取消）。
+type AmountMismatchError struct {
+	Want      int64 // 请求的金额（分）
+	Got       int64 // 网关记录的金额（分）
+	PaymentID string
+}
+
+func (e *AmountMismatchError) Error() string {
+	return fmt.Sprintf("扣款金额不符: 请求 %d 分，网关 %d 分（payment_id=%s）",
+		e.Want, e.Got, e.PaymentID)
+}
+
+// RequestRejectedError 表示网关认为请求本身不合法（400 / 404 / 413 / 422…）。
+//
+// 这类响应几乎一定是调用方自己的 bug（金额为负、字段拼错、请求体超限），
+// 重试不会变好；但它和「拒付」是两件事 —— 拒付是卡的问题，这是我们的问题。
+// 把它归进 DeclinedError 会让 worker 取消订单，等于替 bug 销毁证据：
+// 订单作废、库存回补，代码里的问题一点痕迹都不留。
+type RequestRejectedError struct {
+	Status int
+	Body   string
+}
+
+func (e *RequestRejectedError) Error() string {
+	return fmt.Sprintf("支付网关拒绝请求（%d）: %s", e.Status, e.Body)
 }
 
 type Client struct {
@@ -118,12 +156,20 @@ func (c *Client) Charge(ctx context.Context, orderID string, amountCents int64) 
 		return Result{}, fmt.Errorf("读取支付网关响应失败: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		// 4xx 基本是请求本身有问题（金额非法、字段缺失），重试也不会变
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return Result{}, &DeclinedError{Reason: fmt.Sprintf("gateway_%d: %s", resp.StatusCode, truncate(raw))}
-		}
-		return Result{}, fmt.Errorf("支付网关返回 %d: %s", resp.StatusCode, truncate(raw))
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		// 继续往下解析
+	case resp.StatusCode == http.StatusRequestTimeout,
+		resp.StatusCode == http.StatusTooManyRequests,
+		resp.StatusCode >= 500:
+		// 408 / 429 / 5xx 是明确的「等一下再来」，交给退避重试。
+		// 429 尤其重要：把它当拒付会直接把订单取消，而限流只是暂时的 ——
+		// 「网关让我慢点」不该变成「这单不卖了」。
+		return Result{}, fmt.Errorf("支付网关返回 %d（可重试）: %s", resp.StatusCode, truncate(raw))
+	default:
+		// 其余 4xx：请求本身不合法，重试无意义；但也不该取消订单。
+		// 单独一个类型，让 worker 既不重试也不补偿，只把订单停住等对账。
+		return Result{}, &RequestRejectedError{Status: resp.StatusCode, Body: truncate(raw)}
 	}
 
 	var res Result
@@ -143,6 +189,11 @@ func (c *Client) Charge(ctx context.Context, orderID string, amountCents int64) 
 
 	if res.Status != "succeeded" {
 		return res, &DeclinedError{Reason: res.FailureReason, PaymentID: res.PaymentID}
+	}
+	// 金额校验放在 status 之后：拒付的响应里金额只是「本来打算扣多少」，
+	// 拿它比对没有意义；只有真的扣成功了，金额才是需要核对的事实。
+	if res.AmountCents != amountCents {
+		return res, &AmountMismatchError{Want: amountCents, Got: res.AmountCents, PaymentID: res.PaymentID}
 	}
 	return res, nil
 }

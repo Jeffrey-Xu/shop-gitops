@@ -73,6 +73,17 @@ var (
 		Help: "最老一条未投递 outbox 消息的年龄（秒）",
 	})
 
+	// 已经放弃投递、等人处理的 outbox 行数。
+	//
+	// 与 pending 是相反的量：pending 高说明「还在努力」，dead 高说明
+	// 「已经放弃」。它必须有一个独立的指标和独立告警 ——
+	// 如果把死信算进 pending，pending 会永远降不下来，
+	// 而 OldestOutboxAge 会单调增长，变成一条永久 firing 的告警。
+	OutboxDead = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shop_outbox_dead",
+		Help: "尝试用尽后被标记为死信（dead_at）的 outbox 行数",
+	})
+
 	// 对账差异，按类型分（kind 的取值见 store.MismatchKind）。
 	//
 	// 这是整个指标集里唯一直接对着「钱」的：队列积压、outbox 延迟都是过程量，

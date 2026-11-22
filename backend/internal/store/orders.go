@@ -215,6 +215,11 @@ func (s *Store) GetOrder(ctx context.Context, id int64) (Order, error) {
 // 刻意不带分页：演示目录的订单量很小，加 offset/limit 要连带把「我的订单」
 // 前端改成翻页，收益不成比例。真要做的话游标比 offset 更稳（订单随时在新增，
 // offset 翻页会漏单）。
+//
+// ORDER BY created_at DESC, id DESC 而不是只按 id：orders_user_id_idx 是
+// (user_id, created_at DESC)，按 id 排序用不上它，得把该用户的全部订单
+// 取出来再排序再截断。id 是自增的、和 created_at 同序，加 id 只为
+// 同一毫秒下单时有个确定的次序（分页/对比结果可复现）。
 func (s *Store) ListOrdersByUser(ctx context.Context, userID int64, limit int) ([]Order, error) {
 	if limit <= 0 {
 		limit = 20
@@ -223,7 +228,7 @@ func (s *Store) ListOrdersByUser(ctx context.Context, userID int64, limit int) (
 		SELECT id, user_id, status, total_cents, tracking_no, created_at, updated_at
 		  FROM orders
 		 WHERE user_id = $1
-		 ORDER BY id DESC
+		 ORDER BY created_at DESC, id DESC
 		 LIMIT $2`, userID, limit)
 	if err != nil {
 		return nil, err
