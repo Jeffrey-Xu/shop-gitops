@@ -687,7 +687,7 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - **对账只支持全额退款**：`refunds` 的主键是 `order_id`，一单只能退一次、退全额。部分退款要把主键改成 `(order_id, seq)`、按行分摊金额，而订单模型本身也得先支持「部分成交」——那是另一个量级的改动
 - **对账是直接读网关的库**：`payments` / `refunds` 和 `orders` 在同一个 PG 里，所以对账能一条 SQL JOIN 完。真实的第三方网关不会给你库，只能靠结算文件、对账 API 或 T+1 批处理，并且要按网关的账期切时间窗口。这个简化让「发现差异」很容易，但**发现差异的能力不该被这个巧合绑架**——换成真实网关时，`ScanMismatches` 里那条 SQL 就是第一个要重写的地方
 - **对账没有定时跑**：15s 采样只负责导出指标（发现），动手仍要人跑 `/app/reconcile`。做成 CronJob 之前得先想清楚「谁批准退款」——自动退钱是无人值守的动账，和自动重放消息不是一个风险级别
-- **对账扫描没有专用索引**：现在按 `orders.updated_at` 过滤是全表扫，几十万单以内是毫秒级。真要上量应加 `orders(updated_at)` 上的部分索引（`where status in ('CREATED','CANCELLED')`）
+- **对账扫描用不上现有索引**：`orders_status_idx` 是 `(status, updated_at DESC)`，但对账的四个分类是 `OR` 出来的，没有 `status` 的等值条件，所以只能全表扫（几十万单以内仍是毫秒级）。真要上量应加一条部分索引：`(updated_at) where status in ('CREATED','CANCELLED')`
 
 ## Docker Hub 不可达时怎么出镜像
 

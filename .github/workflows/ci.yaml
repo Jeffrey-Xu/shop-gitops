@@ -28,6 +28,12 @@ jobs:
           # 所以 context 得单独给，不能靠 name 拼
           - name: fulfillment
             context: fulfillment-service
+          # payment 是 Python，之前一直是本地 build + 手工 import 的 local2，
+          # 后果是「改了 payment-service 代码但 CI 不重建」——集群里跑着旧代码
+          # 而 repo 里是新代码。退款就踩在这上面：加 /refund 之后不改这里，
+          # 集群的 payment Pod 永远返回 404。
+          - name: payment
+            context: payment-service
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -86,9 +92,7 @@ jobs:
           set -euo pipefail
           # Docker tag 必须小写，GitHub 用户名 Jeffrey-Xu 是混合大小写
           PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
-          # payment（Python）故意不在列表里：它的镜像还是本地 local1，
-          # 等它的依赖打包也走 CI 了再加进来
-          for svc in backend frontend fulfillment; do
+          for svc in backend frontend fulfillment payment; do
             yq -i "(.images[] | select(.name == \"${PREFIX}/${svc}\") | .newTag) = \"${SHA}\"" deploy/kustomization.yaml
           done
           echo "--- 结果 ---"
@@ -104,7 +108,7 @@ jobs:
 
           PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
           subst() {
-            for svc in backend frontend fulfillment; do
+            for svc in backend frontend fulfillment payment; do
               yq -i "(.images[] | select(.name == \"${PREFIX}/${svc}\") | .newTag) = \"${SHA}\"" deploy/kustomization.yaml
             done
           }

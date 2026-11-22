@@ -23,10 +23,11 @@ images:
     newTag: 2c9d3c79224d8627d1a7346a1aaba585eeb0df2a
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
     newTag: 2c9d3c79224d8627d1a7346a1aaba585eeb0df2a
-  # 支付服务是 Python，不在 CI 矩阵里（见 ci.yaml 的说明），镜像是本地 docker build 出来的。
-  # local2 = 加了 OTel 埋点（FastAPI 自动埋点 + OTLP 导出）的那一版。
-  # 改动 payment-service/ 之后必须重新 build 并改这里的 tag —— CI 不会帮你做这件事，
-  # 这正是本地镜像和服务代码容易悄悄脱节的地方。
+  # 支付服务是 Python。以前它的镜像是本地 docker build 出来的（local1 / local2），
+  # CI 根本不重建 —— 后果是「repo 里改了 payment-service，集群还跑旧代码」。
+  # 加退款端点时就踩在这上面：不把 payment 放进 CI，集群的 Pod 永远 404。
+  # 现在它已在 CI 矩阵里，tag 由 bump 改成 sha；下面的 local2 只是 bootstrap 值，
+  # 仅用于「第一次带 payment 的 CI 还没跑完」这段窗口。
   - name: ghcr.io/jeffrey-xu/shop-gitops/payment
     newTag: local2
   # 履约服务是 Node，镜像单独构建
