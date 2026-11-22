@@ -33,6 +33,7 @@
 | `backend/cmd/account/` | 账号服务入口，注册/登录/签发 JWT |
 | `backend/cmd/backfill/` | 一次性运维工具：给「已 PAID 但无 `order.paid` 事件」的存量订单补 outbox，默认 dry-run |
 | `backend/cmd/replay/` | 运维工具：把 DLQ 里的消息重投回主队列（清 attempts、保留 traceparent），默认 dry-run |
+| `backend/cmd/reconcile/` | 运维工具：对账。找出「钱」与「订单状态」对不上的单，前推漏结的、退款已扣款却作废的，默认 dry-run |
 | `backend/internal/` | `config` `obs` `httpx` `cache` `store` `broker` `outbox` `api` `worker` `account` `auth` `payment` |
 | `backend/internal/store/migrations/` | `go:embed` 的 SQL 迁移，启动时同步执行，失败即退出 |
 | `frontend/` | Vite + 原生 JS，构建成 `dist/` 由 nginx 托管。`src/art.js` 画商品矢量图，`src/cart.js` 管购物车，`src/api.js` 收口所有请求 |
@@ -79,14 +80,22 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/charge` | `{order_id, amount_cents, currency}` → 扣款；同一 `order_id` 重放返回同一条记录且 `replayed=true` |
+| POST | `/refund` | `{order_id, reason}` → 全额退款；同一 `order_id` 只退一次，重放返回同一条 `refund_id`。没扣过款 404，扣款失败 409 |
 | GET | `/payments/{order_id}` | 回查扣款结果，不存在返回 404 |
+| GET | `/refunds/{order_id}` | 回查退款结果，不存在返回 404 |
 | GET | `/healthz` `/readyz` `/metrics` | 存活 / 就绪（查 PG）/ 指标 |
 
 ```bash
 curl -X POST http://localhost/pay/charge -H 'Content-Type: application/json' \
   -d '{"order_id":"ord_001","amount_cents":9900}' -i | tail -1
 # 再发一次 → 同一个 payment_id，replayed: true（幂等，不会重复扣款）
+
+# 退款也是幂等的：第二次调用 refund_id 不变、replayed: true
+curl -X POST http://localhost/pay/refund -H 'Content-Type: application/json' \
+  -d '{"order_id":"ord_001","reason":"用户取消"}'
 ```
+
+`payments` 是**不可变的扣款流水**，退款不会去改它的 `status`，而是往 `refunds` 插一条独立账本记录（主键 `order_id`，只支持全额）。这样「扣了多少、退了多少」两个事实各自可追溯，改一个不改另一个也查得出来。
 
 账号服务（集群内 `svc/account:8080`，集群外走 `/auth` 前缀）：
 
@@ -167,12 +176,20 @@ worker：basic.consume（push，非轮询，prefetch=5）
 ```
 POST /charge 的三种结局
  ├─ succeeded              ──▶ 闸门 2 → PAID
+ │      └─ 但闸门 2 失败（DB 抖动 / 进程被杀 / 约束冲突）
+ │            ──▶ 重试、最终进 DLQ，消息头带 payment_id
+ │                **不取消订单**，由 reconcile 或 replay 前推到 PAID
  ├─ failed / 4xx（拒付）   ──▶ CancelOrder（CANCELLED + 库存回补）──▶ ack   [不重试]
  │                              重试一百次也是同一张卡被拒，纯浪费
  └─ 超时 / 5xx / 连不上
-      ├─ attempts < 3 ──▶ publish 到 shop.dlx / .retry（TTL 10s 回主队列）──▶ ack
+      ├─ attempts < 3 ──▶ publish 到 shop.dlx / .retry（per-message TTL：2s / 4s，带抖动）──▶ ack
       └─ attempts >= 3 ─▶ publish 到 .dlq ──▶ CancelOrder ──▶ ack
 ```
+
+补偿的方向由「钱有没有动」决定，这是这里最容易搞反的一条：
+
+- **还没扣到钱**（超时、5xx、连不上）→ 取消订单 + 回补库存。库里从来没有过这笔钱，作废是干净的。
+- **已经扣到钱、只是状态没落库** → 绝不能取消。取消会把订单置成 `CANCELLED` 并回补库存，而钱已经离开用户账户，结果就是「货不发、钱不退、库存在」——比什么都不做更糟，因为账面上看起来一切正常。正确做法是订单留在 `CREATED`、`payment_id` 带进消息，等 `reconcile` 前推或 `replay` 重投。
 
 未配置 `PAYMENT_URL` 时 worker 退回内置模拟支付，本地不想起 Python 服务也能跑通全链路。
 
@@ -301,7 +318,8 @@ DATABASE_URL=postgres://shop:***@127.0.0.1:5432/shop?sslmode=disable \
 | `order_events` | `from_status`、`to_status`、`UNIQUE(order_id,to_status)` | 状态迁移审计，日志之外的第二证据 |
 | `outbox` | `topic`、`payload jsonb`、`published_at`、`attempts` | 未投递事件队列 |
 | `users` | `email`、`password_hash`、`lower(email)` 唯一索引 | 账号服务拥有；哈希永不出 `store` 包 |
-| `payments` | `order_id` 主键、`status`、`payment_id` | 支付服务拥有 |
+| `payments` | `order_id` 主键、`status`、`payment_id` | 支付服务拥有；**扣款流水，不可变** |
+| `refunds` | `order_id` 主键、`refund_id`、`amount_cents` | 支付服务拥有；退款是独立账本条目，只支持全额 |
 | `shipments` | `order_id UNIQUE`、`tracking_no`、`status`、`next_advance_at` | 履约服务拥有 |
 
 **库存只在 PostgreSQL 扣，Redis 不参与扣减。** 缓存只负责读得快，一致性交给数据库。
@@ -339,7 +357,7 @@ Ingress   shop               shop.localhost + 无 host 兜底
           payment            /pay(/|$)(.*)      → rewrite /$2
           fulfillment        /fulfill(/|$)(.*)  → rewrite /$2
 ServiceMonitor api / worker / account / payment / fulfillment
-PrometheusRule shop         5 条告警
+PrometheusRule shop         7 条告警
 ```
 
 - 六个 Deployment 都是 `replicas: 1` + `strategy: Recreate`。本地学习环境，不做高可用
@@ -441,13 +459,13 @@ ArgoCD CLI 方式：`kubectl port-forward -n argocd svc/argocd-server 8080:80`�
 | tempo | 1.24.4（app 2.9.0） | SingleBinary + filesystem，`retention: 24h`，OTLP 4317/4318 |
 | monitoring-extras | 本仓库 `monitoring/extras` | mailpit、postgres-exporter、redis-exporter、业务大盘 |
 
-**Metric 链路**：应用 `/metrics`（`prometheus/client_golang` + `promauto`）→ `ServiceMonitor`（15s）→ Prometheus（TSDB，7d / 4GB / 8Gi PVC）→ Grafana + 5 条 `PrometheusRule` 告警。
+**Metric 链路**：应用 `/metrics`（`prometheus/client_golang` + `promauto`）→ `ServiceMonitor`（15s）→ Prometheus（TSDB，7d / 4GB / 8Gi PVC）→ Grafana + 7 条 `PrometheusRule` 告警。
 
-- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_payment_calls_total`（`result=succeeded|declined|error|disabled`）、`shop_queue_messages{queue}`（6 个队列全采）、`shop_outbox_pending`、`shop_outbox_oldest_seconds`、`shop_auth_events_total`（`action=register|login`）、`shop_shipment_callbacks_total`（`result=ok|duplicate|invalid|not_found|error`）。
+- 应用指标：`shop_http_requests_total`、`shop_http_request_duration_seconds`、`shop_cache_lookups_total`、`shop_orders_created_total`、`shop_orders_processed_total`、`shop_outbox_published_total`、`shop_payment_calls_total`（`result=succeeded|declined|error|already_charged|disabled`）、`shop_queue_messages{queue}`（6 个队列全采）、`shop_outbox_pending`、`shop_outbox_oldest_seconds`、`shop_payment_mismatch{kind}`（对账差异，只统计超过 2 分钟宽限期的）、`shop_auth_events_total`（`action=register|login`）、`shop_shipment_callbacks_total`（`result=ok|duplicate|invalid|not_found|error`）。
   - `shop_queue_messages` 覆盖两个主队列、两个重试队列、两个 DLQ。只盯主队列时 DLQ 完全不可见，而「主队列空 + DLQ 非空」正是「系统看着正常、钱收不回来」的形态。
   - `shop_outbox_oldest_seconds` 比 `pending` 更能说明链路在不在动：broker 半通时积压涨得很慢，计数看着还行，最老那条已经躺了几分钟。relay 健康时这个值只有几秒（一个轮询周期）。
-- 告警：5xx 比例 >5%、主队列积压 >10、**任一 DLQ >0（1 分钟，critical）**、**outbox 最老一条 >60s（2 分钟，critical）**、outbox 积压 >20（warning）。后两条的区分是刻意的：量大但年龄小是吞吐跟不上，年龄单调增长才是卡死。
-- 支付服务指标：`payment_charges_total`、`payment_charge_duration_seconds`。
+- 告警：5xx 比例 >5%、主队列积压 >10、**任一 DLQ >0（1 分钟，critical）**、**outbox 最老一条 >60s（2 分钟，critical）**、**对账差异 >0（critical：钱收了货不发 / 钱收了单作废）**、账实不符（金额或扣款结果，warning）、outbox 积压 >20（warning）。outbox 那两条的区分是刻意的：量大但年龄小是吞吐跟不上，年龄单调增长才是卡死。
+- 支付服务指标：`payment_charges_total`、`payment_charge_duration_seconds`、`payment_refunds_total`（`result=ok|replayed|not_found|not_refundable`）。
 - 履约服务指标（Node，`prom-client`）：`fulfillment_shipments_created_total`、`fulfillment_advances_total`、`fulfillment_callback_duration_seconds`、`fulfillment_orders_in_flight`、`fulfillment_consumer_connected`，外加 `collectDefaultMetrics` 的进程级指标——其中 **event loop lag 对 Node 特别重要**，一个同步阻塞就能让所有请求延迟抖一下，而这是唯一能看见它的地方。
 - 宿主中间件：PG 与 Redis 用 exporter Pod 去 `host.docker.internal` 抓（`postgres-exporter`、`redis-exporter`），RabbitMQ 自带 `/metrics` 用 `additionalScrapeConfigs` 静态抓 `host.docker.internal:15692`。共 29 个 target 全 up。
 - 大盘：`shop 业务总览`（`grafana.localhost` → Dashboards），15 块面板：下单速率、5xx 比例、P50/95/99、缓存命中率、队列积压、worker 处理结果、outbox 投递结果、支付的**两侧视角**（worker 调了多少次 / 网关自己记了多少笔）、履约的发货建单与状态推进、在途单量、回写耗时、账号注册登录结果。
@@ -536,6 +554,7 @@ GET  /healthz /readyz /metrics
 | **幂等** | `order_id` 是 `payments` 主键。先 `INSERT ... ON CONFLICT DO NOTHING` 再回查，而不是「先查后插」——后者并发下会双扣 |
 | **持久化** | 扣款结果落 PG，进程重启不丢 |
 | **可回查** | `GET /payments/{order_id}`，worker 可以拿它对账 |
+| **可退款** | `POST /refund` 全额退款，幂等靠 `refunds.order_id` 主键；退款是独立账本条目，不去改 `payments` |
 | **拒付是业务结果** | 返回 200 + `status: "failed"` + `failure_reason`，不是 500 |
 
 调用约定（`worker` 侧 `internal/payment`）：
@@ -543,6 +562,8 @@ GET  /healthz /readyz /metrics
 - `PAYMENT_URL` 为空 → 不调网关，走内置模拟支付（本地不想起 Python 时就这样）
 - 4xx 或 `status=failed` → `*DeclinedError`：**一次就取消订单**，不重试
 - 超时（默认 3s）/ 连不上 / 5xx → 普通 error：走指数退避重试（`2s → 4s`，各乘 `[0.5,1.5)` 随机系数），3 次尝试后 DLQ + 补偿
+- 扣款成功但订单状态没写成 → 走另一条路（`retryAfterCharge`）：照样退避重试，但把 `payment_id` 写进消息头，后续 attempt 一律跳过网关；耗尽后进 DLQ，**不取消订单**。一条消息最多只扣一次款，这点由「消息头里的 payment_id」保证，而不是靠网关幂等「兜」——网关幂等是最后一道，不是第一道
+- `Refund(orderID, reason)`：200 正常、404 `ErrPaymentNotFound`（这单没扣过款）、409 `ErrNotRefundable`（扣款本来就是 failed）。**4xx 不映射成 `DeclinedError`**：退款没有「拒付」这个语义，混进去只会让人误判
 
 退避为什么不固定：固定 10 秒时，同一秒失败的一批订单会在第 10、20 秒整批回来 —— 那不是重试，是把一次瞬时抖动复制成三波尖峰，下游刚缓过来就被同一批请求再打一次。延迟由**消息自己**带（`PublishDelayed` 设 per-message `Expiration`），因为队列级 `x-message-ttl` 是队列常量，没法按「第几次重试」变化。队列级 10s 保留为上限兜底。
 
@@ -590,6 +611,26 @@ kubectl -n shop exec deploy/api -- /app/replay -apply
 # 注意：如果订单在重试耗尽时已经被补偿成 CANCELLED，重投不会「复活」它 ——
 # worker 的幂等闸门会直接 skip_duplicate_event。这是对的：
 # 消息重放 ≠ 业务重做，要不要重新下单是人的决定。
+# （例外：失败发生在扣款成功之后，worker 不再取消订单，只把 payment_id
+#   写进消息头进 DLQ —— 这时重投会直接前推到 PAID，一次网关调用都不发。）
+
+# ---- 对账：钱和订单状态对不上 ----
+#
+# 四类差异对应四种处置，工具会按类型分组打印「影响」和「该怎么办」：
+#   stuck_paid          已扣款、订单还 CREATED   → 前推到 PAID
+#   paid_but_cancelled  已扣款、订单已 CANCELLED → 全额退款
+#   amount_mismatch     扣款金额 ≠ 订单金额      → 只报告
+#   paid_but_declined   订单 PAID、网关 failed   → 只报告
+#
+# 前推是「把已收的钱兑现成货」，退款是「动钱」，所以闸门不一样宽：
+kubectl -n shop exec deploy/api -- /app/reconcile                        # dry-run
+kubectl -n shop exec deploy/api -- /app/reconcile -kind stuck-paid       # 只看一类
+kubectl -n shop exec deploy/api -- /app/reconcile -apply                 # 前推，不退钱
+kubectl -n shop exec deploy/api -- /app/reconcile -apply -refund         # 连退款一起做
+
+# 前推成功会写 order.paid 事件，履约服务随即建发货单 —— 线上表现就是「货发出去了」。
+# 判断有没有残留：Grafana 的「对账差异总数」应该回到 0，
+# 或者 Prometheus 里 shop_payment_mismatch{kind=~"stuck_paid|paid_but_cancelled"} 为空。
 
 # 幂等：同一 key 第一次 201，第二次 200，同一个订单号
 curl -X POST http://localhost/api/orders -H 'Content-Type: application/json' \
@@ -641,8 +682,12 @@ curl -s http://localhost/api/orders/<别人的订单号> -i | head -1
 - `/api/internal/*` 和 `/fulfill/*` 都暴露在同一个 Ingress 后面，只靠 token 和应用层挡；生产应该在网关层加路径拒绝
 - **连接池没有可观测性**：池大小可调了，但 `sql.DBStats` 没导出成 Prometheus 指标，所以「压测时到底撞没撞到 10 个连接」还是看不出来。要接 `otelsql.RegisterDBStatsMetrics` 就得再架一个 otel→Prometheus 的桥，暂时没做
 - **DLQ 有告警有工具，但没有自动重放**：`ShopDlqNotEmpty` 响了之后仍然要人跑 `/app/replay`。也没有保留期 —— DLQ 里的消息不会过期，攒几年也没人管。真要做自动重放，得先能区分「可重试的临时故障」和「永远好不了的数据问题」，现在没有这个判断依据
-- **重放不会复活已取消的订单**：订单在重试耗尽时已被补偿成 `CANCELLED`，重投回去 worker 会 `skip_duplicate_event`。这是对的（消息重放 ≠ 业务重做），但意味着「从 DLQ 捞回来」只对「消息丢了、订单还活着」的情况有效
+- **重放不会复活已取消的订单**：订单在重试耗尽时已被补偿成 `CANCELLED`，重投回去 worker 会 `skip_duplicate_event`。这是对的（消息重放 ≠ 业务重做），但意味着「从 DLQ 捞回来」只对「消息丢了、订单还活着」的情况有效。扣款成功之后的失败不在此列：那条路径已经不再取消订单，重投会带着 `payment_id` 直接前推
 - **重试队列本身没有告警**：`ShopQueueBacklog` 只看主队列。重试队列积压（下游持续失败但还没放弃）其实是「故障正在发生」的更早信号
+- **对账只支持全额退款**：`refunds` 的主键是 `order_id`，一单只能退一次、退全额。部分退款要把主键改成 `(order_id, seq)`、按行分摊金额，而订单模型本身也得先支持「部分成交」——那是另一个量级的改动
+- **对账是直接读网关的库**：`payments` / `refunds` 和 `orders` 在同一个 PG 里，所以对账能一条 SQL JOIN 完。真实的第三方网关不会给你库，只能靠结算文件、对账 API 或 T+1 批处理，并且要按网关的账期切时间窗口。这个简化让「发现差异」很容易，但**发现差异的能力不该被这个巧合绑架**——换成真实网关时，`ScanMismatches` 里那条 SQL 就是第一个要重写的地方
+- **对账没有定时跑**：15s 采样只负责导出指标（发现），动手仍要人跑 `/app/reconcile`。做成 CronJob 之前得先想清楚「谁批准退款」——自动退钱是无人值守的动账，和自动重放消息不是一个风险级别
+- **对账扫描没有专用索引**：现在按 `orders.updated_at` 过滤是全表扫，几十万单以内是毫秒级。真要上量应加 `orders(updated_at)` 上的部分索引（`where status in ('CREATED','CANCELLED')`）
 
 ## Docker Hub 不可达时怎么出镜像
 

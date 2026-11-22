@@ -679,6 +679,94 @@
         }
       ],
       "description": "invalid 突然升高可能是撞库尝试"
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "对账：钱与订单状态不一致",
+      "description": "stuck_paid=已扣款但订单仍 CREATED；paid_but_cancelled=已扣款但订单已作废；另外两类只报警不自动处置。指标只统计超过 2 分钟宽限期的单",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "shop_payment_mismatch",
+          "legendFormat": "{{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "对账差异总数",
+      "description": "四类之和。/app/reconcile 可看明细并处置",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(shop_payment_mismatch) or vector(0)",
+          "legendFormat": "不一致"
+        }
+      ]
     }
   ]
 }

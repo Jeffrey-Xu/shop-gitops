@@ -100,13 +100,13 @@ func Load(service string) (Config, error) {
 		RedisAddr:   env("REDIS_ADDR", "127.0.0.1:6379"),
 		RedisPass:   os.Getenv("REDIS_PASSWORD"),
 		// vhost 是 /shop，URL 里必须编码成 %2F，否则会被当成路径分隔符
-		RabbitURL:   env("RABBITMQ_URL", "amqp://shop:shoppass@127.0.0.1:5672/%2Fshop"),
-		Version:     env("APP_VERSION", "dev"),
-		LogLevel:    env("LOG_LEVEL", "info"),
-		CacheTTL:    ttl,
-		DevMode:     env("DEV_MODE", "false") == "true",
-		Prefetch:    atoi(env("MQ_PREFETCH", "5"), 5),
-		MaxAttempts: atoi(env("MQ_MAX_ATTEMPTS", "3"), 3),
+		RabbitURL:      env("RABBITMQ_URL", "amqp://shop:shoppass@127.0.0.1:5672/%2Fshop"),
+		Version:        env("APP_VERSION", "dev"),
+		LogLevel:       env("LOG_LEVEL", "info"),
+		CacheTTL:       ttl,
+		DevMode:        env("DEV_MODE", "false") == "true",
+		Prefetch:       atoi(env("MQ_PREFETCH", "5"), 5),
+		MaxAttempts:    atoi(env("MQ_MAX_ATTEMPTS", "3"), 3),
 		RetryBaseDelay: retryBase,
 		// 故意不给默认值：没设就是「不接网关」，走模拟支付。
 		// 给了默认值会让本地跑的时候意外去连一个不存在的地址。

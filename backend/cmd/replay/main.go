@@ -108,7 +108,7 @@ func main() {
 			continue
 		}
 
-		fmt.Fprintln(tw, "  订单\t尝试\t重放次数\t上次错误\t字节")
+		fmt.Fprintln(tw, "  订单\t尝试\t重放次数\t已扣款\t上次错误\t字节")
 		st, rerr := brk.Replay(ctx, broker.ReplayOptions{
 			Source:         f.source,
 			RestoreRoute:   f.restoreRoute,
@@ -175,7 +175,13 @@ func printRow(w *tabwriter.Writer, headers amqp.Table, body []byte) {
 	if v, ok := headers["last_error"].(string); ok {
 		lastErr = truncate(v, 48)
 	}
-	fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d\n", orderID, attempts, replayed, lastErr, len(body))
+	// 这一列决定了「重投之后会发生什么」：带 payment_id 说明钱已经扣过了，
+	// worker 会跳过网关直接前推订单；没有它才会重新去扣款。
+	charged := "-"
+	if v, ok := headers["payment_id"].(string); ok && v != "" {
+		charged = truncate(v, 24)
+	}
+	fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%d\n", orderID, attempts, replayed, charged, lastErr, len(body))
 }
 
 func truncate(s string, n int) string {

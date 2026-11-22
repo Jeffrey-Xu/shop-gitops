@@ -119,6 +119,14 @@ func main() {
 			if age, err := st.OldestOutboxAge(sctx); err == nil {
 				obs.OutboxOldestSeconds.Set(age.Seconds())
 			}
+			// 对账差异：这是唯一一条「钱」的直读指标，只能靠主动查询。
+			// 查询失败（含 payments 表还不存在）时什么都不写 ——
+			// 写 0 等于告诉告警「一切正常」，而事实是「看不见」。
+			if counts, err := st.CountMismatches(sctx, store.DefaultMismatchGrace); err == nil {
+				for kind, n := range counts {
+					obs.PaymentMismatch.WithLabelValues(string(kind)).Set(float64(n))
+				}
+			}
 			cancel()
 		}
 	}()

@@ -73,6 +73,16 @@ var (
 		Help: "最老一条未投递 outbox 消息的年龄（秒）",
 	})
 
+	// 对账差异，按类型分（kind 的取值见 store.MismatchKind）。
+	//
+	// 这是整个指标集里唯一直接对着「钱」的：队列积压、outbox 延迟都是过程量，
+	// 而 stuck_paid / paid_but_cancelled 是结果 —— 钱已经离开用户账户，
+	// 货却没发、单还作废了。它长期非 0，说明对账没人跑、或者跑不动。
+	PaymentMismatch = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shop_payment_mismatch",
+		Help: "支付与订单状态不一致的订单数（只统计超过宽限期的，每 15s 采样）",
+	}, []string{"kind"})
+
 	// action: register / login；result: ok / invalid / email_taken / bad_input / error
 	AuthEvents = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "shop_auth_events_total",

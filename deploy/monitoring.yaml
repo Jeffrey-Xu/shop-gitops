@@ -63,3 +63,27 @@ spec:
           annotations:
             summary: "outbox 积压 {{ $value }} 行"
             description: "量上来了但还没卡死（年龄告警未触发）。先看下单速率与 relay 的 publish 耗时"
+
+        # 对账差异。指标本身只统计「超过 2 分钟宽限期」的单，
+        # 所以这里 for: 1m 已经意味着「至少卡了 3 分钟」，足够排除正在处理的。
+        #
+        # 为什么单独拎出来而不并进 DLQ 告警：DLQ 空了也可能是这种状态 ——
+        # 消息被 replay 过、被 ack 掉了，钱却始终没落成订单。
+        # 队列看得见「消息」，看不见「钱」。
+        - alert: ShopPaymentMismatch
+          expr: sum(shop_payment_mismatch{kind=~"stuck_paid|paid_but_cancelled"}) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $value }} 单的钱和订单状态对不上"
+            description: "stuck_paid = 已扣款但订单还 CREATED（货不发）；paid_but_cancelled = 已扣款但订单已作废（钱不退）。先跑 kubectl exec deploy/api -- /app/reconcile 看明细，再决定 -apply / -refund"
+
+        - alert: ShopPaymentLedgerMismatch
+          expr: sum(shop_payment_mismatch{kind=~"amount_mismatch|paid_but_declined"}) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} 单的账实不符（金额或扣款结果）"
+            description: "amount_mismatch = 扣款金额≠订单金额；paid_but_declined = 订单 PAID 但网关 failed。这两类不自动处置，需要人工核实是否为改库或网关侧反转"

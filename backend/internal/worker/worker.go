@@ -1,4 +1,10 @@
 // Package worker 消费订单事件：扣款 → 改状态 → 失败则重试 → 超限则补偿。
+//
+// 补偿分两种，取决于钱有没有动：
+//   - 还没扣到钱（超时、5xx）：取消订单 + 回补库存，天经地义。
+//   - 已经扣到钱、只是状态没落库：绝不取消。订单留在 CREATED，
+//     payment_id 跟着消息进 DLQ，由 reconcile 前推或 replay 重放。
+//     路径搞反了就是「钱收了、货不发、单还作废」。
 package worker
 
 import (
@@ -9,6 +15,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -40,8 +47,15 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	var ev store.OrderCreatedEvent
 	if err := json.Unmarshal(msg.Body, &ev); err != nil {
-		// 解不开的消息重试一万次也没用，直接丢（真实项目应进 DLQ 留证据）
+		// 解不开的消息重试一万次也没用，但不能悄悄 ack 掉 ——
+		// 直接丢等于把「有一单没被处理」这个事实一起删了。
+		// 原样扔进 DLQ，至少留下证据和 body。
 		w.Log.Error("bad_event_payload", "err", err, "body", string(msg.Body))
+		headers := amqp.Table{"last_error": "unmarshal: " + err.Error()}
+		if perr := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderDLQ, msg.Body, headers); perr != nil {
+			w.Log.Error("bad_payload_dlq_failed", "err", perr)
+			return msg.Nack(true)
+		}
 		_ = msg.Ack()
 		return nil
 	}
@@ -80,22 +94,37 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 		return w.retry(ctx, msg, ev, attempts, log, errors.New("演示注入：支付渠道超时"))
 	}
 
-	// 真正的支付动作。三种结局必须分开，这是这段代码的核心：
-	//   成功            → 继续把订单推进到 PAID
-	//   拒付 Declined   → 业务终态，重试没意义，直接取消 + 回补库存
-	//   其他 error      → 临时故障（超时/5xx），走退避重试
-	note, paymentID, err := w.charge(ctx, ev, attempts, log)
-	var declined *payment.DeclinedError
-	switch {
-	case errors.As(err, &declined):
-		obs.PaymentCalls.WithLabelValues("declined").Inc()
-		w.cancel(ctx, ev, log, "order_cancelled_on_decline",
-			"worker: payment declined: "+declined.Reason)
-		_ = msg.Ack()
-		return nil
-	case err != nil:
-		obs.PaymentCalls.WithLabelValues("error").Inc()
-		return w.retry(ctx, msg, ev, attempts, log, err)
+	// 上一次尝试已经扣款成功、只是订单状态没落库（或者这条消息被 replay 回来）。
+	// 这时绝不能再调一次网关：钱已经扣了，要做的只是把订单推进到 PAID。
+	//
+	// payment_id 随消息头传下来，而 replay 只清 attempts、保留其它头，
+	// 所以「把 DLQ 里那条消息重投一遍」就能救回「扣了款没改状态」的单 ——
+	// 不需要人工去网关查单号再手改数据库。
+	paymentID := headerString(msg.Headers, "payment_id")
+	note := ""
+	if paymentID != "" {
+		obs.PaymentCalls.WithLabelValues("already_charged").Inc()
+		note = chargeNote(paymentID)
+		log.Info("reuse_captured_payment", "payment_id", paymentID)
+	} else {
+		// 真正的支付动作。三种结局必须分开，这是这段代码的核心：
+		//   成功            → 继续把订单推进到 PAID
+		//   拒付 Declined   → 业务终态，重试没意义，直接取消 + 回补库存
+		//   其他 error      → 临时故障（超时/5xx），走退避重试
+		var cerr error
+		note, paymentID, cerr = w.charge(ctx, ev, attempts, log)
+		var declined *payment.DeclinedError
+		switch {
+		case errors.As(cerr, &declined):
+			obs.PaymentCalls.WithLabelValues("declined").Inc()
+			w.cancel(ctx, ev, log, "order_cancelled_on_decline",
+				"worker: payment declined: "+declined.Reason)
+			_ = msg.Ack()
+			return nil
+		case cerr != nil:
+			obs.PaymentCalls.WithLabelValues("error").Inc()
+			return w.retry(ctx, msg, ev, attempts, log, cerr)
+		}
 	}
 
 	start := time.Now()
@@ -104,7 +133,12 @@ func (w *Worker) handle(ctx context.Context, msg broker.Message) error {
 	// order.paid 事件也在同一个事务里写 outbox，履约服务靠它触发发货。
 	changed, err := w.Store.MarkOrderPaid(ctx, ev.OrderID, note, paymentID)
 	if err != nil {
-		return w.retry(ctx, msg, ev, attempts, log, err)
+		// 走到这里钱已经在网关侧落了账。这条路径上**不允许** cancel ——
+		// 取消会把订单置成 CANCELLED 并回补库存，而钱已经扣了：
+		// 「货不发、钱不退、库存在」是最糟的一种不一致。
+		// 正确做法是把 payment_id 带进重试/死信，让后续 attempt 或
+		// 对账任务把订单前推到 PAID。
+		return w.retryAfterCharge(ctx, msg, ev, attempts, log, err, paymentID)
 	}
 	if !changed {
 		log.Info("order_already_finalized")
@@ -128,7 +162,8 @@ func (w *Worker) charge(ctx context.Context, ev store.OrderCreatedEvent, attempt
 	if w.Pay == nil || !w.Pay.Enabled() {
 		obs.PaymentCalls.WithLabelValues("disabled").Inc()
 		// 模拟支付的单号带 sim_ 前缀，一眼就能和真实网关的区分开
-		return "worker: payment captured (simulated)", fmt.Sprintf("sim_%d", ev.OrderID), nil
+		pid := fmt.Sprintf("sim_%d", ev.OrderID)
+		return chargeNote(pid), pid, nil
 	}
 
 	// worker 没有入站 HTTP 请求，自己造一个 request id 传给网关；
@@ -141,22 +176,70 @@ func (w *Worker) charge(ctx context.Context, ev store.OrderCreatedEvent, attempt
 
 	obs.PaymentCalls.WithLabelValues("succeeded").Inc()
 	log.Info("payment_captured", "payment_id", res.PaymentID, "replayed", res.Replayed)
-	return fmt.Sprintf("worker: payment captured (%s)", res.PaymentID), res.PaymentID, nil
+	return chargeNote(res.PaymentID), res.PaymentID, nil
+}
+
+// chargeNote 只由 paymentID 决定，必须是纯函数。
+// 因为重试时消息头里只有 payment_id，note 是照着它重新拼出来的 ——
+// 两处格式一旦漂移，order_events 里同一个单会出现两种文案。
+func chargeNote(paymentID string) string {
+	if strings.HasPrefix(paymentID, "sim_") {
+		return "worker: payment captured (simulated)"
+	}
+	return fmt.Sprintf("worker: payment captured (%s)", paymentID)
 }
 
 // retry 决定「再试一次」还是「认输并补偿」。
-// 注意先 publish 再 ack：如果 publish 失败就把原消息退回队列，
-// 不能既没发出去又把原消息确认掉。
+// 只用于**还没扣到钱**的失败：超时、5xx、连接失败都属于这一类，
+// 认输时取消订单 + 回补库存是完全正确的补偿。
 func (w *Worker) retry(ctx context.Context, msg broker.Message, ev store.OrderCreatedEvent, attempts int, log *slog.Logger, cause error) error {
+	return w.reschedule(ctx, msg, ev, attempts, log, cause, "")
+}
+
+// retryAfterCharge 处理「钱已经扣了，但订单状态没落库」的失败（几乎都是 DB 侧的）。
+//
+// 和 retry 的唯一差别：认输时不 cancel，也不回补库存 —— 那条路会让
+// 「已扣款」变成「订单作废且不退款」。这里把 payment_id 写进消息头之后
+// 再进 DLQ：下一次尝试（或一周后有人跑 replay）读到它就直接前推到 PAID，
+// 一次网关调用都不用发。
+//
+// 如果连 DLQ 都发不出去，就 nack(requeue) 把原消息退回主队列，
+// 至少保证「钱扣了」这件事不会随着消息一起消失。
+func (w *Worker) retryAfterCharge(ctx context.Context, msg broker.Message, ev store.OrderCreatedEvent, attempts int, log *slog.Logger, cause error, paymentID string) error {
+	return w.reschedule(ctx, msg, ev, attempts, log, cause, paymentID)
+}
+
+// reschedule 是两条重试路径的公共实现。paymentID 非空表示「这一单已经扣过款」，
+// 它决定两件事：消息头里多带 payment_id，以及耗尽重试时不做取消补偿。
+//
+// 顺序上先 publish 再 ack：如果 publish 失败就把原消息退回队列，
+// 不能既没发出去又把原消息确认掉 —— 那等于消息凭空消失。
+func (w *Worker) reschedule(ctx context.Context, msg broker.Message, ev store.OrderCreatedEvent, attempts int, log *slog.Logger, cause error, paymentID string) error {
+	headers := amqp.Table{
+		"attempts":   int32(attempts + 1),
+		"last_error": cause.Error(),
+	}
+	if paymentID != "" {
+		headers["payment_id"] = paymentID
+	}
+
 	if attempts+1 >= w.Cfg.MaxAttempts {
-		headers := amqp.Table{
-			"attempts":   int32(attempts + 1),
-			"last_error": cause.Error(),
-		}
 		if err := w.Broker.PublishTo(ctx, broker.DLX, broker.RouteOrderDLQ, msg.Body, headers); err != nil {
 			obs.OrdersProcessed.WithLabelValues("dlq_publish_error").Inc()
 			log.Error("dlq_publish_failed", "err", err)
 			return msg.Nack(true)
+		}
+
+		if paymentID != "" {
+			// 订单故意留在 CREATED：钱已经收了，这个单必须被前推，
+			// 不能被补偿成 CANCELLED。reconcile 会把它算进 stuck_paid，
+			// replay 这条 DLQ 消息也能带上 payment_id 直接重放。
+			obs.OrdersProcessed.WithLabelValues("dlq_after_charge").Inc()
+			log.Error("finalize_failed_after_charge",
+				"payment_id", paymentID,
+				"impact", "订单停在 CREATED，钱已扣；用 reconcile 前推或 replay 重放",
+				"err", cause)
+			return msg.Ack()
 		}
 
 		// 补偿：订单作废 + 库存回补（库存是下单时预扣的）
@@ -166,10 +249,6 @@ func (w *Worker) retry(ctx context.Context, msg broker.Message, ev store.OrderCr
 		return msg.Ack()
 	}
 
-	headers := amqp.Table{
-		"attempts":   int32(attempts + 1),
-		"last_error": cause.Error(),
-	}
 	delay := w.retryDelay(attempts)
 	if err := w.Broker.PublishDelayed(ctx, broker.DLX, broker.RouteOrderRetry, msg.Body, headers, delay); err != nil {
 		obs.OrdersProcessed.WithLabelValues("retry_publish_error").Inc()
@@ -177,7 +256,7 @@ func (w *Worker) retry(ctx context.Context, msg broker.Message, ev store.OrderCr
 		return msg.Nack(true)
 	}
 	obs.OrdersProcessed.WithLabelValues("retry").Inc()
-	log.Warn("order_retry_scheduled", "err", cause, "delay_ms", delay.Milliseconds())
+	log.Warn("order_retry_scheduled", "err", cause, "delay_ms", delay.Milliseconds(), "charged", paymentID != "")
 	return msg.Ack()
 }
 
@@ -250,4 +329,20 @@ func headerInt(h amqp.Table, key string) int {
 		return v
 	}
 	return 0
+}
+
+// headerString 取字符串头。JSON 往返、别的客户端投递时类型可能是
+// string 也可能是 []byte，两种都认，否则 payment_id 会静默读成空串 ——
+// 那样重试就会再去扣一次款（幂等兜住了，但白跑一趟网关，日志也会骗人）。
+func headerString(h amqp.Table, key string) string {
+	if h == nil {
+		return ""
+	}
+	switch v := h[key].(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	}
+	return ""
 }

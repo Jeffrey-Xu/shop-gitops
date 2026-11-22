@@ -2,11 +2,12 @@
 
 定位：模拟第三方支付网关，只做一件事——对某个订单一次性扣款，并且幂等。
 
-真实网关（Stripe / Adyen）的四个关键行为这里都有：
+真实网关（Stripe / Adyen）的五个关键行为这里都有：
   1. 幂等：同一个 order_id 重复调用拿到同一个结果，绝不重复扣款
   2. 持久化：扣款结果是落库的事实，进程重启不丢
   3. 可回查：调用方可以拿 order_id 查状态（对账用）
   4. 拒付是业务结果，不是 500 —— 支付失败要能被调用方正常解析
+  5. 可退款：扣了钱但业务上必须作废时，钱要能退回去，且退款本身也幂等
 
 环境变量：
   DATABASE_URL          PG 连接串，默认指向本地 shop 库
@@ -133,6 +134,7 @@ CHARGE_LATENCY = Histogram(
     "扣款耗时",
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
 )
+REFUNDS = Counter("payment_refunds_total", "退款请求数", ["result"])
 
 
 # --------------------------------------------------------------------------
@@ -149,6 +151,19 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at     timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS payments_created_at_idx ON payments (created_at DESC);
+
+-- 退款是**独立账本条目**，不是给 payments 加一列 refunded=true。
+-- 原因：payments 是「扣款事实」的不可变记录，事后改它就等于篡改流水；
+-- 而退款本身也需要自己的时间、原因和单号（真实网关还会分多次部分退款）。
+-- 现在只支持全额退款，所以 order_id 做主键天然幂等。
+CREATE TABLE IF NOT EXISTS refunds (
+    order_id     text PRIMARY KEY REFERENCES payments (order_id),
+    refund_id    text        NOT NULL,
+    amount_cents bigint      NOT NULL CHECK (amount_cents > 0),
+    reason       text        NOT NULL DEFAULT '',
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS refunds_created_at_idx ON refunds (created_at DESC);
 """
 
 pool: ConnectionPool | None = None
@@ -224,6 +239,20 @@ class ChargeResponse(BaseModel):
     amount_cents: int
     currency: str
     failure_reason: str | None = None
+    replayed: bool = False
+
+
+class RefundRequest(BaseModel):
+    order_id: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="", max_length=200)
+
+
+class RefundResponse(BaseModel):
+    order_id: str
+    refund_id: str
+    amount_cents: int
+    status: str
+    reason: str | None = None
     replayed: bool = False
 
 
@@ -333,6 +362,100 @@ def get_payment(order_id: str) -> ChargeResponse:
         status=row[3],
         payment_id=row[4],
         failure_reason=row[5],
+    )
+
+
+# --------------------------------------------------------------------------
+# 退款
+#
+# 为什么网关要有这个端点：调用方（worker / 对账任务）会在「钱扣了但订单
+# 得作废」的时候需要把钱退回去。没有退款端点，那种场景的结局只有一个 ——
+# 客服手工转账，且对账永远对不平。
+#
+# 只支持**全额退款**，这是刻意的：部分退款要引入退款明细、
+# 按行分摊金额、以及「退了几次、总共退了多少钱」的约束，
+# 而本项目不存在「部分成交」的场景（下单就是全成或全不成）。
+# 真要做部分退款，`refunds` 的主键要改成 (order_id, seq)。
+# --------------------------------------------------------------------------
+@app.post("/refund", response_model=RefundResponse)
+def refund(req: RefundRequest) -> RefundResponse:
+    with get_pool().connection() as conn:
+        pay = conn.execute(
+            "SELECT amount_cents, status FROM payments WHERE order_id = %s",
+            (req.order_id,),
+        ).fetchone()
+        if pay is None:
+            # 从没扣过款的单不能退：不是「退成功」，是没有这件事。
+            REFUNDS.labels(result="not_found").inc()
+            raise HTTPException(status_code=404, detail="payment not found")
+
+        amount_cents, pay_status = pay
+        if pay_status != "succeeded":
+            # 拒付的单没有钱可退。409 而不是 200：调用方必须能区分
+            # 「退成功」和「本来就没扣钱」，否则退款计数器会虚高。
+            REFUNDS.labels(result="not_refundable").inc()
+            raise HTTPException(
+                status_code=409, detail=f"payment not refundable: status={pay_status}"
+            )
+
+        refund_id = "rfd_" + hashlib.sha256(req.order_id.encode()).hexdigest()[:20]
+        # 先插后判，和 charge 同一套幂等套路：并发下唯一约束是唯一的裁判。
+        row = conn.execute(
+            """
+            INSERT INTO refunds (order_id, refund_id, amount_cents, reason)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (order_id) DO NOTHING
+            RETURNING order_id, refund_id, amount_cents, reason
+            """,
+            (req.order_id, refund_id, amount_cents, req.reason),
+        ).fetchone()
+        replayed = row is None
+        if replayed:
+            row = conn.execute(
+                """
+                SELECT order_id, refund_id, amount_cents, reason
+                FROM refunds WHERE order_id = %s
+                """,
+                (req.order_id,),
+            ).fetchone()
+
+    order_id, rid, amount, reason = row
+    REFUNDS.labels(result="replayed" if replayed else "ok").inc()
+    log.info(
+        "refund",
+        extra={
+            "extra_fields": {
+                "order_id": order_id,
+                "refund_id": rid,
+                "amount_cents": amount,
+                "replayed": replayed,
+            }
+        },
+    )
+    return RefundResponse(
+        order_id=order_id,
+        refund_id=rid,
+        amount_cents=amount,
+        status="refunded",
+        reason=reason,
+        replayed=replayed,
+    )
+
+
+@app.get("/refunds/{order_id}", response_model=RefundResponse)
+def get_refund(order_id: str) -> RefundResponse:
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            SELECT order_id, refund_id, amount_cents, reason
+            FROM refunds WHERE order_id = %s
+            """,
+            (order_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return RefundResponse(
+        order_id=row[0], refund_id=row[1], amount_cents=row[2], status="refunded", reason=row[3]
     )
 
 
