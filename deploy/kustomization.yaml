@@ -20,9 +20,9 @@ images:
   # 内容等价于 backend 主干 + payment 客户端接线。
   # fulfill1 = 加了 account 二进制的那一版（同样走本地交叉编译打包）。
   - name: ghcr.io/jeffrey-xu/shop-gitops/backend
-    newTag: a235c67718f5e7eb6443c56d6060b76c2f6b7ae0
+    newTag: 2c9d3c79224d8627d1a7346a1aaba585eeb0df2a
   - name: ghcr.io/jeffrey-xu/shop-gitops/frontend
-    newTag: a235c67718f5e7eb6443c56d6060b76c2f6b7ae0
+    newTag: 2c9d3c79224d8627d1a7346a1aaba585eeb0df2a
   # 支付服务是 Python，不在 CI 矩阵里（见 ci.yaml 的说明），镜像是本地 docker build 出来的。
   # local2 = 加了 OTel 埋点（FastAPI 自动埋点 + OTLP 导出）的那一版。
   # 改动 payment-service/ 之后必须重新 build 并改这里的 tag —— CI 不会帮你做这件事，
@@ -31,7 +31,7 @@ images:
     newTag: local2
   # 履约服务是 Node，镜像单独构建
   - name: ghcr.io/jeffrey-xu/shop-gitops/fulfillment
-    newTag: a235c67718f5e7eb6443c56d6060b76c2f6b7ae0
+    newTag: 2c9d3c79224d8627d1a7346a1aaba585eeb0df2a
 labels:
   - pairs:
       app.kubernetes.io/managed-by: argocd
